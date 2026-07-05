@@ -51,7 +51,7 @@ export default class CheckSortedPlugin extends Plugin {
 	private lastCursorLine = -1;
 	private lastCheckboxSnapshot = '';
 
-	private handleCheckboxClick = (evt: MouseEvent) => {
+	private handleCheckboxMouseDown = (evt: MouseEvent) => {
 		if (!(evt.ctrlKey || evt.metaKey)) return;
 
 		const target = evt.target as HTMLElement;
@@ -72,7 +72,10 @@ export default class CheckSortedPlugin extends Plugin {
 		evt.stopPropagation();
 
 		try {
-			const pos = cm.posAtDOM(target);
+			const cmLine = target.closest(".cm-line");
+			if (!cmLine) return;
+
+			const pos = cm.posAtDOM(cmLine);
 			const lineNum = editor.offsetToPos(pos).line;
 			const lineText = editor.getLine(lineNum);
 
@@ -87,7 +90,21 @@ export default class CheckSortedPlugin extends Plugin {
 				editor.setLine(lineNum, newLineText);
 			}
 		} catch (e) {
-			console.error("CheckSorted: Failed to handle Ctrl/Cmd+click", e);
+			console.error("CheckSorted: Failed to handle Ctrl/Cmd+click on mousedown", e);
+		}
+	};
+
+	private handleCheckboxClick = (evt: MouseEvent) => {
+		if (!(evt.ctrlKey || evt.metaKey)) return;
+
+		const target = evt.target as HTMLElement;
+		if (!target) return;
+
+		const isCheckboxInput = target.tagName === "INPUT" && (target as HTMLInputElement).type === "checkbox";
+		const isCheckboxClass = target.classList.contains("task-list-item-checkbox");
+		if (isCheckboxInput || isCheckboxClass) {
+			evt.preventDefault();
+			evt.stopPropagation();
 		}
 	};
 
@@ -143,10 +160,12 @@ export default class CheckSortedPlugin extends Plugin {
 		this.updateStatusBar();
 		this.setupAutoMove();
 
+		document.addEventListener("mousedown", this.handleCheckboxMouseDown, true);
 		document.addEventListener("click", this.handleCheckboxClick, true);
 	}
 
 	onunload() {
+		document.removeEventListener("mousedown", this.handleCheckboxMouseDown, true);
 		document.removeEventListener("click", this.handleCheckboxClick, true);
 	}
 
