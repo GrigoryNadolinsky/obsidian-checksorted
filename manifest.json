@@ -1,7 +1,7 @@
 {
 	"id": "checksorted",
 	"name": "CheckSorted",
-	"version": "1.0.36",
+	"version": "1.1.0",
 	"minAppVersion": "1.4.0",
 	"description": "Keep checkbox lists tidy: move completed items into a separate section, autocomplete tasks, and delete them in one click.",
 	"author": "Javad Esmaeelpour",

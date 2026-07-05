@@ -352,11 +352,12 @@ export default class CheckSortedPlugin extends Plugin {
 			if (singleItemRegex.test(mainLines[i])) removedAbove++;
 		}
 
-		const suffix = this.settings.dateStamp
-			? ` ✅ ${moment().format(this.settings.dateFormat)}`
-			: "";
-
-		const stamped = newItems.map((item) => `${item}${suffix}`);
+		const stamped = newItems.map((item) => {
+			if (this.settings.dateStamp && !/ ✅ \S/.test(item)) {
+				return `${item} ✅ ${moment().format(this.settings.dateFormat)}`;
+			}
+			return item;
+		});
 		const allItems =
 			this.settings.sortOrder === "prepend"
 				? [...stamped, ...existing]
