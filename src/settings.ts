@@ -9,6 +9,7 @@ export interface CheckSortedSettings {
 	dateStamp: boolean;
 	dateFormat: string;
 	sortOrder: "append" | "prepend";
+	sortMethod: "global" | "in-place";
 }
 
 export const DEFAULT_SETTINGS: CheckSortedSettings = {
@@ -22,4 +23,5 @@ export const DEFAULT_SETTINGS: CheckSortedSettings = {
 	dateStamp: false,
 	dateFormat: "YYYY-MM-DD",
 	sortOrder: "append",
+	sortMethod: "global",
 };

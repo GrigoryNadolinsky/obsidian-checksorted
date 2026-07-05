@@ -48,46 +48,62 @@ export class CheckSortedSettingTab extends PluginSettingTab {
 	}
 
 	private renderGeneral(el: HTMLElement): void {
-		const areaSection = this.section(el, "Completed Area");
+		const areaSection = this.section(el, "Sorting & Completed Area");
 
 		new Setting(areaSection)
-			.setName("Header level")
-			.setDesc("Heading level for the completed area (H1–H6).")
+			.setName("Sort method")
+			.setDesc("Choose how completed items are sorted.")
 			.addDropdown((drop) =>
 				drop
-					.addOptions({ "1": "H1", "2": "H2", "3": "H3", "4": "H4", "5": "H5", "6": "H6" })
-					.setValue(this.plugin.settings.completedAreaHierarchy)
-					.onChange(async (value) => {
-						this.plugin.settings.completedAreaHierarchy = value;
+					.addOptions({ "global": "Global completed area", "in-place": "In-place list sorting" })
+					.setValue(this.plugin.settings.sortMethod)
+					.onChange(async (value: "global" | "in-place") => {
+						this.plugin.settings.sortMethod = value;
 						await this.plugin.saveSettings();
+						this.display(); // Re-render to show/hide relevant settings
 					})
 			);
 
-		new Setting(areaSection)
-			.setName("Header name")
-			.setDesc("Text of the completed area heading.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Completed")
-					.setValue(this.plugin.settings.completedAreaName)
-					.onChange(async (value) => {
-						this.plugin.settings.completedAreaName = value || "Completed";
-						await this.plugin.saveSettings();
-					})
-			);
+		if (this.plugin.settings.sortMethod === "global") {
+			new Setting(areaSection)
+				.setName("Header level")
+				.setDesc("Heading level for the completed area (H1–H6).")
+				.addDropdown((drop) =>
+					drop
+						.addOptions({ "1": "H1", "2": "H2", "3": "H3", "4": "H4", "5": "H5", "6": "H6" })
+						.setValue(this.plugin.settings.completedAreaHierarchy)
+						.onChange(async (value) => {
+							this.plugin.settings.completedAreaHierarchy = value;
+							await this.plugin.saveSettings();
+						})
+				);
 
-		new Setting(areaSection)
-			.setName("New items order")
-			.setDesc("Where to place newly moved items within the completed area.")
-			.addDropdown((drop) =>
-				drop
-					.addOptions({ append: "Append (bottom)", prepend: "Prepend (top)" })
-					.setValue(this.plugin.settings.sortOrder)
-					.onChange(async (value: "append" | "prepend") => {
-						this.plugin.settings.sortOrder = value;
-						await this.plugin.saveSettings();
-					})
-			);
+			new Setting(areaSection)
+				.setName("Header name")
+				.setDesc("Text of the completed area heading.")
+				.addText((text) =>
+					text
+						.setPlaceholder("Completed")
+						.setValue(this.plugin.settings.completedAreaName)
+						.onChange(async (value) => {
+							this.plugin.settings.completedAreaName = value || "Completed";
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(areaSection)
+				.setName("New items order")
+				.setDesc("Where to place newly moved items within the completed area.")
+				.addDropdown((drop) =>
+					drop
+						.addOptions({ append: "Append (bottom)", prepend: "Prepend (top)" })
+						.setValue(this.plugin.settings.sortOrder)
+						.onChange(async (value: "append" | "prepend") => {
+							this.plugin.settings.sortOrder = value;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
 
 		const dateSection = this.section(el, "Date Stamp");
 

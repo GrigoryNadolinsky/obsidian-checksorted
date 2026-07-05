@@ -191,21 +191,24 @@ export default class CheckSortedPlugin extends Plugin {
 
 				if (!this.settings.autoMove) return;
 
-				// returnUncheckedItems fires on explicit checkbox toggle or on exit from completed.
-				// It does NOT fire on lineChanged within the completed section, avoiding cursor chaos
-				// when the user presses Enter or navigates inside that section.
-				if (exitedCompleted || checkboxChanged) {
-					this.returnUncheckedItems(editor, exitedCompleted);
-				}
-				if (lineChanged || checkboxChanged) {
-					this.moveCompletedItems(editor, true);
+				if (this.settings.sortMethod === "global") {
+					if (exitedCompleted || checkboxChanged) {
+						this.returnUncheckedItems(editor, exitedCompleted);
+					}
+					if (lineChanged || checkboxChanged) {
+						this.moveCompletedItems(editor, true);
+					}
+				} else {
+					if (checkboxChanged) {
+						this.moveCompletedItems(editor, true);
+					}
 				}
 			})
 		);
 	}
 
 	private getCheckboxSnapshot(content: string): string {
-		return (content.match(/^[ \t]*[-*+] \[[xX ]\]/gm) ?? []).join('');
+		return (content.match(/^[ \t]*[-*+] \[[xX \/]\]/gm) ?? []).join('');
 	}
 
 	// cleanEmpty=true: also discard empty "- [ ] " continuation lines (called on exit from completed).
@@ -225,8 +228,8 @@ export default class CheckSortedPlugin extends Plugin {
 
 		// With cleanEmpty, .* also catches empty "- [ ] " continuation lines.
 		const uncheckedRegex = cleanEmpty
-			? /^([ \t]*[-*+] \[ \] .*)\r?\n?/gm
-			: /^([ \t]*[-*+] \[ \] .+)\r?\n?/gm;
+			? /^([ \t]*[-*+] \[[ \/]\] .*)\r?\n?/gm
+			: /^([ \t]*[-*+] \[[ \/]\] .+)\r?\n?/gm;
 		const uncheckedMatches = [...afterHeader.matchAll(uncheckedRegex)];
 
 		if (uncheckedMatches.length === 0) return;
@@ -236,10 +239,10 @@ export default class CheckSortedPlugin extends Plugin {
 		// behind in the completed section and renders with a bullet (● ☐).
 		const cleanedSection = afterHeader
 			.replace(uncheckedRegex, "")
-			.replace(/^[ \t]*[-*+] \[ \][ \t]*(\r?\n|$)/gm, "")
+			.replace(/^[ \t]*[-*+] \[[ \/]\][ \t]*(\r?\n|$)/gm, "")
 			.trimEnd();
 
-		const hasContent = /^[ \t]*[-*+] \[ \] \S/;
+		const hasContent = /^[ \t]*[-*+] \[[ \/]\] \S/;
 		const returnedItems = uncheckedMatches
 			.filter((m) => hasContent.test(m[1]))
 			.map((m) => m[1].replace(/\s*✅.*$/, ""));
@@ -267,8 +270,8 @@ export default class CheckSortedPlugin extends Plugin {
 
 		// Use the same predicate as uncheckedRegex so we only count actually-removed lines.
 		const removedPredicate = cleanEmpty
-			? /^[ \t]*[-*+] \[ \] /
-			: /^[ \t]*[-*+] \[ \] \S/;
+			? /^[ \t]*[-*+] \[[ \/]\] /
+			: /^[ \t]*[-*+] \[[ \/]\] \S/;
 		const removedAboveCursor = afterHeader
 			.split("\n")
 			.slice(0, Math.max(0, preCursorLine - afterHeaderDocLine))
@@ -324,6 +327,11 @@ export default class CheckSortedPlugin extends Plugin {
 	moveCompletedItems(editor: Editor, silent = false): void {
 		if (this.isProcessing) return;
 
+		if (this.settings.sortMethod === "in-place") {
+			this.sortItemsInPlace(editor, silent);
+			return;
+		}
+
 		const content = editor.getValue();
 		const cursor = editor.getCursor();
 		const { main, completedItems: existing } = this.splitContent(content);
@@ -374,6 +382,165 @@ export default class CheckSortedPlugin extends Plugin {
 		this.isProcessing = false;
 	}
 
+	private sortItemsInPlace(editor: Editor, silent = false): void {
+		const content = editor.getValue();
+		const cursor = editor.getCursor();
+		const tag = `___CS_CURSOR_TAG___${Math.random()}`;
+
+		const lines = content.split("\n");
+		if (cursor.line < lines.length) {
+			const line = lines[cursor.line];
+			lines[cursor.line] = line.slice(0, cursor.ch) + tag + line.slice(cursor.ch);
+		}
+		const taggedContent = lines.join("\n");
+
+		const sortedTaggedContent = this.sortItemsInPlaceContent(taggedContent);
+
+		const sortedLines = sortedTaggedContent.split("\n");
+		let newCursorLine = cursor.line;
+		let newCursorCh = cursor.ch;
+		for (let i = 0; i < sortedLines.length; i++) {
+			const idx = sortedLines[i].indexOf(tag);
+			if (idx !== -1) {
+				newCursorLine = i;
+				newCursorCh = idx;
+				sortedLines[i] = sortedLines[i].replace(tag, "");
+				break;
+			}
+		}
+		const finalContent = sortedLines.join("\n");
+
+		if (finalContent === content) {
+			if (!silent) new Notice("List is already sorted.");
+			return;
+		}
+
+		this.isProcessing = true;
+		this.setValuePreservingScroll(editor, finalContent, newCursorLine);
+		editor.setCursor({ line: newCursorLine, ch: newCursorCh });
+		this.isProcessing = false;
+	}
+
+	private sortItemsInPlaceContent(content: string): string {
+		const lines = content.split("\n");
+		let outLines: string[] = [];
+		const listItemRegex = /^([ \t]*)([-*+]|\d+\.) (?:\[([ xX\/])\] )?(.*)$/;
+
+		interface Node {
+			indent: number;
+			originalLine: string;
+			state: number; // 0=unchecked/none, 1=half, 2=checked
+			children: Node[];
+			isContinuation: boolean;
+			order: number;
+		}
+
+		let i = 0;
+		while (i < lines.length) {
+			if (listItemRegex.test(lines[i])) {
+				let blockLines: string[] = [];
+				while (i < lines.length) {
+					const line = lines[i];
+					if (line.trim() === "") {
+						let nextNonEmpty = i + 1;
+						while (nextNonEmpty < lines.length && lines[nextNonEmpty].trim() === "") nextNonEmpty++;
+						if (nextNonEmpty < lines.length) {
+							const nextLine = lines[nextNonEmpty];
+							const match = listItemRegex.exec(nextLine);
+							const isIndented = /^[ \t]+/.test(nextLine);
+							if (match || isIndented) {
+								blockLines.push(line);
+								i++;
+								continue;
+							}
+						}
+						break;
+					}
+					const match = listItemRegex.exec(line);
+					const isIndented = /^[ \t]+/.test(line);
+					if (match || isIndented) {
+						blockLines.push(line);
+						i++;
+					} else {
+						break;
+					}
+				}
+
+				const root: Node = { indent: -1, originalLine: "", state: 0, children: [], isContinuation: false, order: 0 };
+				const stack: Node[] = [root];
+
+				for (let j = 0; j < blockLines.length; j++) {
+					let line = blockLines[j];
+					const match = listItemRegex.exec(line);
+					if (match) {
+						const indent = match[1].length;
+						const checkbox = match[3];
+						let state = 0;
+						if (checkbox === "/") state = 1;
+						else if (checkbox === "x" || checkbox === "X") {
+							state = 2;
+							if (this.settings.dateStamp && !/ ✅ \S/.test(line)) {
+								line = line + ` ✅ ${moment().format(this.settings.dateFormat)}`;
+							}
+						}
+
+						const node: Node = {
+							indent,
+							originalLine: line,
+							state,
+							children: [],
+							isContinuation: false,
+							order: j
+						};
+
+						while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
+							stack.pop();
+						}
+
+						stack[stack.length - 1].children.push(node);
+						stack.push(node);
+					} else {
+						const node: Node = {
+							indent: Infinity,
+							originalLine: line,
+							state: 0,
+							children: [],
+							isContinuation: true,
+							order: j
+						};
+						stack[stack.length - 1].children.push(node);
+					}
+				}
+
+				const sortNode = (node: Node) => {
+					node.children.sort((a, b) => {
+						if (a.isContinuation && !b.isContinuation) return -1;
+						if (!a.isContinuation && b.isContinuation) return 1;
+						if (a.state !== b.state) return a.state - b.state;
+						return a.order - b.order;
+					});
+					for (const child of node.children) {
+						sortNode(child);
+					}
+				};
+
+				sortNode(root);
+
+				const flatten = (node: Node) => {
+					for (const child of node.children) {
+						outLines.push(child.originalLine);
+						flatten(child);
+					}
+				};
+				flatten(root);
+			} else {
+				outLines.push(lines[i]);
+				i++;
+			}
+		}
+		return outLines.join("\n");
+	}
+
 	// Called by CheckboxSuggest when an autocomplete suggestion is accepted.
 	// Rebuilds the line being typed with its own checkbox state and the chosen
 	// task text, then deletes the original occurrence. If the source item had a
@@ -398,7 +565,7 @@ export default class CheckSortedPlugin extends Plugin {
 		}
 
 		// m[0] is the "<indent>- [<state>] " prefix of the line being typed.
-		const prefix = /^\s*[-*+] \[[ xX]\] /.exec(lines[targetLine]);
+		const prefix = /^\s*[-*+] \[[ xX\/]\] /.exec(lines[targetLine]);
 		if (!prefix) return;
 
 		lines[targetLine] = `${prefix[0]}${text}`;
@@ -430,6 +597,11 @@ export default class CheckSortedPlugin extends Plugin {
 	}
 
 	restoreCompletedItems(editor: Editor): void {
+		if (this.settings.sortMethod === "in-place") {
+			this.restoreCompletedItemsInPlace(editor);
+			return;
+		}
+
 		const content = editor.getValue();
 		const { main, completedItems } = this.splitContent(content);
 
@@ -453,7 +625,36 @@ export default class CheckSortedPlugin extends Plugin {
 		);
 	}
 
+	private restoreCompletedItemsInPlace(editor: Editor): void {
+		const content = editor.getValue();
+		const lines = content.split("\n");
+		let count = 0;
+		const lineRegex = /^([ \t]*[-*+] )\[[xX\/]\] (.*)$/;
+		for (let i = 0; i < lines.length; i++) {
+			const match = lineRegex.exec(lines[i]);
+			if (match) {
+				const prefix = match[1];
+				const rest = match[2].replace(/\s*✅.*$/, "");
+				lines[i] = `${prefix}[ ] ${rest}`;
+				count++;
+			}
+		}
+		if (count === 0) {
+			new Notice("No completed or half-completed items to restore.");
+			return;
+		}
+		this.isProcessing = true;
+		this.setValuePreservingScroll(editor, lines.join("\n"));
+		this.isProcessing = false;
+		new Notice(`Restored ${count} item${count !== 1 ? "s" : ""}.`);
+	}
+
 	clearCompletedArea(editor: Editor): void {
+		if (this.settings.sortMethod === "in-place") {
+			this.clearCompletedItemsInPlace(editor);
+			return;
+		}
+
 		const content = editor.getValue();
 		const { main, completedItems } = this.splitContent(content);
 
@@ -471,6 +672,53 @@ export default class CheckSortedPlugin extends Plugin {
 				completedItems.length !== 1 ? "s" : ""
 			}.`
 		);
+	}
+
+	private clearCompletedItemsInPlace(editor: Editor): void {
+		const content = editor.getValue();
+		const lines = content.split("\n");
+		const newLines: string[] = [];
+		let count = 0;
+		const checkedRegex = /^[ \t]*[-*+] \[[xX]\]/;
+		for (let i = 0; i < lines.length; i++) {
+			if (checkedRegex.test(lines[i])) {
+				count++;
+				const baseIndentMatch = /^[ \t]*/.exec(lines[i]);
+				const baseIndent = baseIndentMatch ? baseIndentMatch[0].length : 0;
+				while (i + 1 < lines.length) {
+					const nextLine = lines[i + 1];
+					if (nextLine.trim() === "") {
+						let nextNonEmpty = i + 2;
+						while (nextNonEmpty < lines.length && lines[nextNonEmpty].trim() === "") nextNonEmpty++;
+						if (nextNonEmpty < lines.length && /^[ \t]+/.test(lines[nextNonEmpty])) {
+							const nextIndent = /^[ \t]*/.exec(lines[nextNonEmpty])![0].length;
+							if (nextIndent > baseIndent) {
+								i = nextNonEmpty;
+								continue;
+							}
+						}
+						break;
+					}
+					const isListItem = /^[ \t]*[-*+]/.test(nextLine);
+					const nextIndent = /^[ \t]*/.exec(nextLine)![0].length;
+					if (!isListItem && nextIndent > baseIndent) {
+						i++;
+					} else {
+						break;
+					}
+				}
+			} else {
+				newLines.push(lines[i]);
+			}
+		}
+		if (count === 0) {
+			new Notice("No completed items to clear.");
+			return;
+		}
+		this.isProcessing = true;
+		this.setValuePreservingScroll(editor, newLines.join("\n"));
+		this.isProcessing = false;
+		new Notice(`Cleared ${count} completed item${count !== 1 ? "s" : ""}.`);
 	}
 
 	private setValuePreservingScroll(
@@ -531,7 +779,7 @@ class CheckboxSuggest extends EditorSuggest<CheckboxSuggestion> {
 		if (!this.plugin.settings.autocomplete) return null;
 
 		const line = editor.getLine(cursor.line);
-		const prefix = /^\s*[-*+] \[[ xX]\] /.exec(line);
+		const prefix = /^\s*[-*+] \[[ xX\/]\] /.exec(line);
 		if (!prefix) return null;
 
 		const textStart = prefix[0].length;
@@ -551,7 +799,7 @@ class CheckboxSuggest extends EditorSuggest<CheckboxSuggestion> {
 		const query = context.query.toLowerCase();
 		const currentLine = context.start.line;
 		const lines = context.editor.getValue().split("\n");
-		const itemRegex = /^\s*[-*+] \[([ xX])\] (.*)$/;
+		const itemRegex = /^\s*[-*+] \[([ xX\/])\] (.*)$/;
 
 		const seen = new Set<string>();
 		const results: CheckboxSuggestion[] = [];
@@ -565,7 +813,7 @@ class CheckboxSuggest extends EditorSuggest<CheckboxSuggestion> {
 			const text = m[2].replace(/\s*✅.*$/, "").trim();
 			if (!text || !text.toLowerCase().startsWith(query)) continue;
 
-			const checked = m[1] !== " ";
+			const checked = m[1] !== " " && m[1] !== "/";
 			const key = `${checked ? "1" : "0"}:${text.toLowerCase()}`;
 			if (seen.has(key)) continue;
 			seen.add(key);
@@ -696,7 +944,7 @@ function dateStampExtension(plugin: CheckSortedPlugin) {
 
 // Editor extension that puts a DeleteTaskWidget at the end of every checkbox line.
 function deleteButtonExtension(plugin: CheckSortedPlugin) {
-	const checkbox = /^\s*[-*+] \[[ xX]\]\s/;
+	const checkbox = /^\s*[-*+] \[[ xX\/]\]\s/;
 
 	return ViewPlugin.fromClass(
 		class {
