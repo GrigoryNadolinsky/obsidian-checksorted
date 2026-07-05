@@ -51,6 +51,46 @@ export default class CheckSortedPlugin extends Plugin {
 	private lastCursorLine = -1;
 	private lastCheckboxSnapshot = '';
 
+	private handleCheckboxClick = (evt: MouseEvent) => {
+		if (!(evt.ctrlKey || evt.metaKey)) return;
+
+		const target = evt.target as HTMLElement;
+		if (!target) return;
+
+		const isCheckboxInput = target.tagName === "INPUT" && (target as HTMLInputElement).type === "checkbox";
+		const isCheckboxClass = target.classList.contains("task-list-item-checkbox");
+		if (!isCheckboxInput && !isCheckboxClass) return;
+
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view || !view.editor) return;
+
+		const editor = view.editor;
+		const cm = (editor as any).cm;
+		if (!cm || typeof cm.posAtDOM !== "function") return;
+
+		evt.preventDefault();
+		evt.stopPropagation();
+
+		try {
+			const pos = cm.posAtDOM(target);
+			const lineNum = editor.offsetToPos(pos).line;
+			const lineText = editor.getLine(lineNum);
+
+			const match = /^(\s*[-*+] )\[([ xX\/])\] (.*)$/.exec(lineText);
+			if (match) {
+				const prefix = match[1];
+				const state = match[2];
+				const rest = match[3];
+
+				const newState = state === "/" ? " " : "/";
+				const newLineText = `${prefix}[${newState}] ${rest}`;
+				editor.setLine(lineNum, newLineText);
+			}
+		} catch (e) {
+			console.error("CheckSorted: Failed to handle Ctrl/Cmd+click", e);
+		}
+	};
+
 	async onload() {
 		await this.loadSettings();
 		addIcon("checksorted", RIBBON_ICON);
@@ -103,41 +143,11 @@ export default class CheckSortedPlugin extends Plugin {
 		this.updateStatusBar();
 		this.setupAutoMove();
 
-		this.registerDomEvent(document, "click", (evt: MouseEvent) => {
-			if (!(evt.ctrlKey || evt.metaKey)) return;
+		document.addEventListener("click", this.handleCheckboxClick, true);
+	}
 
-			const target = evt.target as HTMLElement;
-			if (!target || !target.classList.contains("task-list-item-checkbox")) return;
-
-			const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-			if (!view || !view.editor) return;
-
-			const editor = view.editor;
-			const cm = (editor as any).cm;
-			if (!cm || typeof cm.posAtDOM !== "function") return;
-
-			evt.preventDefault();
-			evt.stopPropagation();
-
-			try {
-				const pos = cm.posAtDOM(target);
-				const lineNum = editor.offsetToPos(pos).line;
-				const lineText = editor.getLine(lineNum);
-
-				const match = /^(\s*[-*+] )\[([ xX\/])\] (.*)$/.exec(lineText);
-				if (match) {
-					const prefix = match[1];
-					const state = match[2];
-					const rest = match[3];
-
-					const newState = state === "/" ? " " : "/";
-					const newLineText = `${prefix}[${newState}] ${rest}`;
-					editor.setLine(lineNum, newLineText);
-				}
-			} catch (e) {
-				console.error("CheckSorted: Failed to handle Ctrl/Cmd+click", e);
-			}
-		});
+	onunload() {
+		document.removeEventListener("click", this.handleCheckboxClick, true);
 	}
 
 	updateRibbonIcon(): void {
