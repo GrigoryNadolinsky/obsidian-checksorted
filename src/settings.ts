@@ -13,6 +13,8 @@ export interface CheckSortedSettings {
 	keepEmptyParents: boolean;
 	cascadeRestore: boolean;
 	contextStatus: string;
+	completedParentBehavior: "none" | "move" | "stay";
+	parentDeleteBehavior: "cascade" | "promote";
 }
 
 export const DEFAULT_SETTINGS: CheckSortedSettings = {
@@ -30,4 +32,6 @@ export const DEFAULT_SETTINGS: CheckSortedSettings = {
 	keepEmptyParents: true,
 	cascadeRestore: true,
 	contextStatus: "c",
+	completedParentBehavior: "none",
+	parentDeleteBehavior: "cascade",
 };

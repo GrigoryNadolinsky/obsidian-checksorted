@@ -49,8 +49,8 @@
 	text-decoration: none !important;
 }
 
-/* Structural parent copies in the completed area. They look completed but
-   are deliberately dim and cannot be toggled like real tasks. */
+/* Structural parent copies in the completed area are persistence-only and
+   cannot be toggled like real tasks. */
 .checksorted-context-line,
 li.checksorted-context-task {
 	color: var(--text-muted);
@@ -58,6 +58,16 @@ li.checksorted-context-task {
 
 li.checksorted-context-task li {
 	color: var(--text-normal);
+}
+
+/* Context rows are persistence-only. Keep their nested list in the layout,
+   while hiding the synthetic parent checkbox/text in Reading view. */
+li.checksorted-context-task {
+	list-style: none;
+}
+
+li.checksorted-context-task > .checksorted-context-content {
+	display: none !important;
 }
 
 .checksorted-context-line .task-list-item-checkbox,

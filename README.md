@@ -17,9 +17,9 @@ Auto-move works in both editing and Reading view on desktop and mobile. In Readi
 
 #### Keep nested tasks together
 
-Completing a child copies its full parent path into the completed area and merges it with an existing matching path. Parent copies use a dim, non-interactive context checkbox (by default `[c]`), while the real completed child remains `[x]`. Completing a parent checks and moves its entire subtree. Unchecking it can restore either the whole subtree or only the parent, depending on your settings.
+Completing a child stores its full parent path in the completed area and merges it with an existing matching path. Those structural parent rows and all CheckSorted metadata stay hidden; only the real completed child is rendered. Completing a parent checks and moves its entire subtree. Unchecking it can restore either the whole subtree or only the parent, depending on your settings. Stable hidden metadata keeps duplicate task names, arbitrary nesting, and original sibling order unambiguous throughout completion and restoration.
 
-Indented comments, links, images, and other continuation content travel with their owning task. The one-click delete button is cascading too: deleting a parent removes its complete indented block.
+Indented comments, links, images, and other continuation content travel with their owning task. The one-click delete button can either remove a parent's complete logical subtree—including children already in Completed—or remove only the parent and promote its children one level.
 
 #### Sync both ways in one click
 
@@ -106,11 +106,13 @@ Unchecking an item in the completed area automatically returns it to the main li
 | Header level | H2 | Heading level for the completed section |
 | Header name | `Completed` | Text of the completed section heading |
 | Keep empty parent items | On | Keep a parent in the active list after its last child moves to the completed area |
-| Context checkbox status | `c` | Custom one-character status for dim, non-interactive parent copies |
+| Context checkbox status | `c` | Custom one-character status used internally for hidden structural parent copies |
 | Show ribbon icon | On | Display the trigger icon in the left sidebar |
 | Show status bar toggle | On | Show `CheckSorted ✓ / ✗` in the bottom status bar — click to toggle auto-move |
 | Auto-move on complete | On | Automatically move items to the completed area when checked |
 | Restore descendants with parent | On | Unchecking a completed parent restores and unchecks its entire subtree |
+| When all child tasks are completed | Leave parent open | Leave the parent open, complete and move it, or complete it in place |
+| When deleting a parent task | Delete parent and children | Delete the complete logical subtree or promote the parent's children one level |
 | Show delete button | On | Show a × on the right of each checkbox line in the editor; click it to delete that task |
 | Task autocomplete | On | Suggest matching tasks while typing in a checkbox; selecting one moves it to the line you're typing |
 | Date stamp | Off | Append `✅ <date>` when items are moved |
@@ -135,14 +137,14 @@ Once approved, CheckSorted will be installable directly from Obsidian:
 
 1. Install **BRAT** from the Obsidian community plugins
 2. Open BRAT settings and click **Add Beta Plugin**
-3. Paste this URL: `https://github.com/Esmaeelpour/obsidian-checksorted`
+3. Paste this URL: `https://github.com/GrigoryNadolinsky/obsidian-checksorted`
 4. Enable **CheckSorted** in **Settings → Community Plugins**
 
 BRAT will also handle updates automatically.
 
 ### Manual
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/Esmaeelpour/obsidian-checksorted/releases)
+1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](https://github.com/GrigoryNadolinsky/obsidian-checksorted/releases)
 2. Copy all three files into your vault at `.obsidian/plugins/checksorted/`
 3. Reload Obsidian and enable **CheckSorted** in **Settings → Community Plugins**
 

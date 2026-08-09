@@ -25,10 +25,12 @@ import { CheckSortedSettings, DEFAULT_SETTINGS } from "./settings";
 import { CheckSortedSettingTab } from "./settingsTab";
 import {
 	appendMarker,
+	AUTO_STAY_MARKER,
 	CASCADE_MARKER,
 	CascadeOptions,
 	CONTEXT_MARKER,
-	indentationWidth,
+	deleteTaskCascadeTrees,
+	ensureCascadeMetadata,
 	isContextNode,
 	isTreeNode,
 	moveCompletedCascadeTrees,
@@ -40,6 +42,7 @@ import {
 	setTaskState,
 	stripTaskMetadata,
 	synchronizeCascadeTrees,
+	taskIdAtOrdinal,
 	TaskTreeNode,
 	TreeEntry,
 } from "./taskTree";
@@ -328,6 +331,7 @@ export default class CheckSortedPlugin extends Plugin {
 				? moment().format(this.settings.dateFormat)
 				: null,
 			sortOrder: this.settings.sortOrder,
+			completedParentBehavior: this.settings.completedParentBehavior,
 		};
 	}
 
@@ -368,6 +372,61 @@ export default class CheckSortedPlugin extends Plugin {
 			moved: result.moved,
 			restored: result.restored,
 		};
+	}
+
+	deleteTaskAtOffset(view: EditorView, offset: number): void {
+		const content = view.state.doc.toString();
+		const targetLine = view.state.doc.lineAt(offset);
+		const newContent = this.transformDeleteContent(content, targetLine.number - 1);
+		if (newContent === content) return;
+		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: newContent } });
+	}
+
+	private transformDeleteContent(content: string, targetLineNumber: number): string {
+		const lines = content.split("\n");
+		if (targetLineNumber < 0 || targetLineNumber >= lines.length) return content;
+		const targetOffset = lines
+			.slice(0, targetLineNumber)
+			.reduce((length, line) => length + line.length + 1, 0);
+		const header = this.settings.sortMethod === "global"
+			? this.getHeaderRegex().exec(content)
+			: null;
+		const inCompleted = !!header && targetOffset > header.index + header[0].length;
+		const mainSource = header ? content.substring(0, header.index).trimEnd() : content;
+		const completedSource = header
+			? content.substring(header.index + header[0].length).trimStart()
+			: "";
+		const sideStart = inCompleted
+			? content.indexOf(completedSource, header!.index + header![0].length)
+			: 0;
+		const preceding = content.substring(sideStart, targetOffset);
+		const ordinal = preceding
+			.split("\n")
+			.filter((line) => /^\s*(?:[-*+]|\d+\.) (?:\[[^\]]\] )?/.test(line))
+			.length;
+		const main = parseTree(mainSource);
+		const completed = parseTree(completedSource);
+		const options = this.getCascadeOptions();
+		ensureCascadeMetadata(main, completed, options.contextStatus);
+		const targetId = taskIdAtOrdinal(inCompleted ? completed : main, ordinal);
+		if (!targetId) return content;
+
+		const result = deleteTaskCascadeTrees(
+			main,
+			completed,
+			targetId,
+			this.settings.parentDeleteBehavior,
+			options
+		);
+		if (!result.deleted) return content;
+		const newMain = serializeTree(result.main).trimEnd();
+		const newCompleted = serializeTree(result.completed).trim();
+		const newContent = newCompleted
+			? newMain
+				? `${newMain}\n\n${this.getHeaderStr()}\n${newCompleted}`
+				: `${this.getHeaderStr()}\n${newCompleted}`
+			: newMain;
+		return newContent;
 	}
 
 	updateRibbonIcon(): void {
@@ -535,7 +594,7 @@ export default class CheckSortedPlugin extends Plugin {
 		const content = editor.getValue();
 		const cursor = editor.getCursor();
 		const result = this.transformGlobalContent(content, "move");
-		if (result.moved === 0 || result.content === content) {
+		if (result.content === content) {
 			if (!silent) new Notice("No completed items to move.");
 			return;
 		}
@@ -618,6 +677,7 @@ export default class CheckSortedPlugin extends Plugin {
 			return count;
 		};
 		const rank = (node: TaskTreeNode): number => {
+			if (node.line.includes(AUTO_STAY_MARKER)) return 0;
 			if (isContextNode(node, contextStatus)) return 2;
 			if (node.state === "/") return 1;
 			if (node.state === "x" || node.state === "X") return 2;
@@ -626,15 +686,43 @@ export default class CheckSortedPlugin extends Plugin {
 		const visit = (entries: TreeEntry[]) => {
 			for (const entry of entries) {
 				if (!isTreeNode(entry)) continue;
-				const checked = entry.state === "x" || entry.state === "X";
-				if (checked && !isContextNode(entry, contextStatus)) {
-					stamp(entry);
-					if (completeDescendants(entry) > 0) appendMarker(entry, CASCADE_MARKER);
-				} else if (entry.line.includes(CASCADE_MARKER)) {
+				visit(entry.entries);
+				let checked = entry.state === "x" || entry.state === "X";
+				if (!checked && entry.line.includes(CASCADE_MARKER)) {
 					if (this.settings.cascadeRestore) uncheckSubtree(entry);
 					else stripTaskMetadata(entry);
 				}
-				visit(entry.entries);
+
+				const directChildren = entry.entries
+					.filter(isTreeNode)
+					.filter((child) => child.state !== null && !isContextNode(child, contextStatus));
+				const allChildrenCompleted = directChildren.length > 0 && directChildren.every(
+					(child) => child.state === "x" || child.state === "X"
+				);
+				if (
+					this.settings.completedParentBehavior !== "none" &&
+					allChildrenCompleted &&
+					entry.state !== null &&
+					!(entry.state === "x" || entry.state === "X")
+				) {
+					setTaskState(entry, "x");
+					if (this.settings.completedParentBehavior === "stay") {
+						appendMarker(entry, AUTO_STAY_MARKER);
+					}
+				} else if (
+					!allChildrenCompleted &&
+					entry.line.includes(AUTO_STAY_MARKER)
+				) {
+					setTaskState(entry, " ");
+					entry.line = entry.line.replace(new RegExp(`\\s*${escapeRegex(AUTO_STAY_MARKER)}`, "g"), "").trimEnd();
+					stripTaskMetadata(entry);
+				}
+
+				checked = entry.state === "x" || entry.state === "X";
+				if (checked && !isContextNode(entry, contextStatus)) {
+					stamp(entry);
+					if (completeDescendants(entry) > 0) appendMarker(entry, CASCADE_MARKER);
+				}
 			}
 
 			// Sort only adjacent sibling items. A heading, paragraph, or other
@@ -854,6 +942,12 @@ export default class CheckSortedPlugin extends Plugin {
 		) {
 			this.settings.contextStatus = DEFAULT_SETTINGS.contextStatus;
 		}
+		if (!["none", "move", "stay"].includes(this.settings.completedParentBehavior)) {
+			this.settings.completedParentBehavior = DEFAULT_SETTINGS.completedParentBehavior;
+		}
+		if (!["cascade", "promote"].includes(this.settings.parentDeleteBehavior)) {
+			this.settings.parentDeleteBehavior = DEFAULT_SETTINGS.parentDeleteBehavior;
+		}
 	}
 
 	async saveSettings() {
@@ -996,6 +1090,10 @@ class CheckboxSuggest extends EditorSuggest<CheckboxSuggestion> {
 
 // A clickable "×" rendered at the end of a checkbox line that deletes that line.
 class DeleteTaskWidget extends WidgetType {
+	constructor(private plugin: CheckSortedPlugin) {
+		super();
+	}
+
 	toDOM(view: EditorView): HTMLElement {
 		const btn = createSpan({
 			cls: "checksorted-delete-task",
@@ -1008,31 +1106,13 @@ class DeleteTaskWidget extends WidgetType {
 			e.stopPropagation();
 			const pos = view.posAtDOM(btn);
 			const line = view.state.doc.lineAt(pos);
-			const indent = /^[ \t]*/.exec(line.text)?.[0] ?? "";
-			const baseWidth = indentationWidth(indent);
-			let lastIncluded = line;
-
-			// A task owns every following non-empty line with a deeper indent.
-			// Blank lines between owned lines are included by the final range, while
-			// spacing before the next sibling remains untouched.
-			for (let number = line.number + 1; number <= view.state.doc.lines; number++) {
-				const candidate = view.state.doc.line(number);
-				if (candidate.text.trim() === "") continue;
-				const candidateIndent = /^[ \t]*/.exec(candidate.text)?.[0] ?? "";
-				if (indentationWidth(candidateIndent) <= baseWidth) break;
-				lastIncluded = candidate;
-			}
-
-			const isLast = lastIncluded.to >= view.state.doc.length;
-			const from = isLast && line.from > 0 ? line.from - 1 : line.from;
-			const to = isLast ? lastIncluded.to : lastIncluded.to + 1;
-			view.dispatch({ changes: { from, to, insert: "" } });
+			this.plugin.deleteTaskAtOffset(view, line.from);
 		});
 		return btn;
 	}
 
 	eq(): boolean {
-		return true;
+		return false;
 	}
 
 	ignoreEvent(): boolean {
@@ -1077,10 +1157,28 @@ function decorateReadingContexts(
 		checkbox.disabled = true;
 		checkbox.tabIndex = -1;
 		checkbox.setAttribute("aria-disabled", "true");
+		// Keep the structural <li> (and therefore its nested list) in the DOM,
+		// but hide every direct piece of the synthetic parent row. The real child
+		// tasks remain visible through their nested <ul>/<ol>.
+		for (const child of Array.from(item.childNodes)) {
+			if (
+				child instanceof HTMLElement &&
+				(child.tagName === "UL" || child.tagName === "OL")
+			) continue;
+			if (child instanceof HTMLElement) {
+				child.addClass("checksorted-context-content");
+			} else if ((child.textContent ?? "").trim()) {
+				const hidden = document.createElement("span");
+				hidden.className = "checksorted-context-content";
+				hidden.textContent = child.textContent;
+				item.replaceChild(hidden, child);
+			}
+		}
 	});
 }
 
 function contextTaskExtension(plugin: CheckSortedPlugin) {
+	const internalMarker = /%%checksorted-(?:context|cascade|auto-stay|id:[A-Za-z0-9_-]+|order:\d+(?:\.\d+)*)%%/g;
 	return ViewPlugin.fromClass(
 		class {
 			decorations: DecorationSet;
@@ -1102,17 +1200,25 @@ function contextTaskExtension(plugin: CheckSortedPlugin) {
 					while (position <= to) {
 						const line = view.state.doc.lineAt(position);
 						const state = /^\s*(?:[-*+]|\d+\.) \[([^\]])\]/.exec(line.text)?.[1];
-						if (
+						const isContext =
 							line.text.includes(CONTEXT_MARKER) ||
-							state === plugin.settings.contextStatus
-						) {
+							state === plugin.settings.contextStatus;
+						if (isContext) {
 							builder.add(
 								line.from,
-								line.from,
-								Decoration.line({
-									attributes: { class: "checksorted-context-line" },
-								})
+								line.to,
+								Decoration.replace({})
 							);
+						} else {
+							internalMarker.lastIndex = 0;
+							let marker: RegExpExecArray | null;
+							while ((marker = internalMarker.exec(line.text))) {
+								builder.add(
+									line.from + marker.index,
+									line.from + marker.index + marker[0].length,
+									Decoration.replace({})
+								);
+							}
 						}
 						position = line.to + 1;
 					}
@@ -1216,12 +1322,17 @@ function deleteButtonExtension(plugin: CheckSortedPlugin) {
 					let pos = from;
 					while (pos <= to) {
 						const line = view.state.doc.lineAt(pos);
-						if (checkbox.test(line.text)) {
+						const state = /^\s*(?:[-*+]|\d+\.) \[([^\]])\]/.exec(line.text)?.[1];
+						if (
+							checkbox.test(line.text) &&
+							!line.text.includes(CONTEXT_MARKER) &&
+							state !== plugin.settings.contextStatus
+						) {
 							builder.add(
 								line.to,
 								line.to,
 								Decoration.widget({
-									widget: new DeleteTaskWidget(),
+									widget: new DeleteTaskWidget(plugin),
 									side: 1,
 								})
 							);

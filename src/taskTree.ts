@@ -1,5 +1,13 @@
 export const CONTEXT_MARKER = "%%checksorted-context%%";
 export const CASCADE_MARKER = "%%checksorted-cascade%%";
+export const AUTO_STAY_MARKER = "%%checksorted-auto-stay%%";
+export const ID_MARKER_PREFIX = "%%checksorted-id:";
+export const ORDER_MARKER_PREFIX = "%%checksorted-order:";
+
+const ID_MARKER = /%%checksorted-id:([A-Za-z0-9_-]+)%%/;
+const ORDER_MARKER = /%%checksorted-order:(\d+(?:\.\d+)*)%%/;
+const INTERNAL_MARKER = /\s*%%checksorted-(?:context|cascade|auto-stay|id:[A-Za-z0-9_-]+|order:\d+(?:\.\d+)*)%%/g;
+let generatedId = 0;
 
 export type TreeEntry = string | TaskTreeNode;
 
@@ -147,10 +155,82 @@ export function stripTaskMetadata(node: TaskTreeNode): void {
 
 export function normalizedText(node: TaskTreeNode): string {
 	return node.text
-		.replace(new RegExp(escapeRegex(CONTEXT_MARKER), "g"), "")
-		.replace(new RegExp(escapeRegex(CASCADE_MARKER), "g"), "")
+		.replace(INTERNAL_MARKER, "")
 		.replace(/\s*✅.*$/, "")
 		.trim();
+}
+
+export function taskId(node: TaskTreeNode): string | null {
+	return ID_MARKER.exec(node.line)?.[1] ?? null;
+}
+
+export function taskOrder(node: TaskTreeNode): string | null {
+	return ORDER_MARKER.exec(node.line)?.[1] ?? null;
+}
+
+function newTaskId(): string {
+	const cryptoApi = globalThis.crypto as Crypto | undefined;
+	if (cryptoApi?.randomUUID) return cryptoApi.randomUUID().replace(/-/g, "");
+	generatedId++;
+	return `${Date.now().toString(36)}${generatedId.toString(36)}`;
+}
+
+function setIdentity(node: TaskTreeNode, id: string, order: string): void {
+	if (!taskId(node)) appendMarker(node, `${ID_MARKER_PREFIX}${id}%%`);
+	if (taskOrder(node) === null) appendMarker(node, `${ORDER_MARKER_PREFIX}${order}%%`);
+}
+
+function nodeMatches(a: TaskTreeNode, b: TaskTreeNode): boolean {
+	const aId = taskId(a);
+	const bId = taskId(b);
+	if (aId && bId) return aId === bId;
+	return normalizedText(a) === normalizedText(b);
+}
+
+function ensureMetadata(entries: TreeEntry[]): void {
+	let order = 0;
+	for (const entry of entries) {
+		if (!isTreeNode(entry)) continue;
+		const ownsTask = entry.state !== null || entry.entries.some((child) =>
+			isTreeNode(child) && (child.state !== null || hasChildItems(child))
+		);
+		if (ownsTask) setIdentity(entry, taskId(entry) ?? newTaskId(), taskOrder(entry) ?? String(order));
+		ensureMetadata(entry.entries);
+		order++;
+	}
+}
+
+function inheritContextMetadata(
+	activeEntries: TreeEntry[],
+	completedEntries: TreeEntry[],
+	contextStatus: string
+): void {
+	const used = new Set<TaskTreeNode>();
+	for (const completed of completedEntries) {
+		if (!isTreeNode(completed) || !isContextNode(completed, contextStatus)) continue;
+		const match = activeEntries.find((candidate) =>
+			isTreeNode(candidate) && !used.has(candidate) && nodeMatches(candidate, completed)
+		) as TaskTreeNode | undefined;
+		if (!match) continue;
+		used.add(match);
+		const id = taskId(match);
+		if (id && !taskId(completed)) appendMarker(completed, `${ID_MARKER_PREFIX}${id}%%`);
+		const order = taskOrder(match);
+		if (order !== null && taskOrder(completed) === null) {
+			appendMarker(completed, `${ORDER_MARKER_PREFIX}${order}%%`);
+		}
+		inheritContextMetadata(match.entries, completed.entries, contextStatus);
+	}
+}
+
+export function ensureCascadeMetadata(
+	main: TreeEntry[],
+	completed: TreeEntry[],
+	contextStatus: string
+): void {
+	ensureMetadata(main);
+	inheritContextMetadata(main, completed, contextStatus);
+	ensureMetadata(completed);
 }
 
 export function isContextNode(node: TaskTreeNode, contextStatus: string): boolean {
@@ -169,8 +249,14 @@ export function reindentNode(node: TaskTreeNode, indent: string): void {
 	refreshNode(node);
 
 	const adjust = (entries: TreeEntry[]) => {
-		for (const entry of entries) {
+		for (let index = 0; index < entries.length; index++) {
+			const entry = entries[index];
 			if (typeof entry === "string") {
+				if (entry.trim() !== "") {
+					const currentIndent = /^[ \t]*/.exec(entry)?.[0] ?? "";
+					const targetWidth = Math.max(0, indentationWidth(currentIndent) + delta);
+					entries[index] = " ".repeat(targetWidth) + entry.slice(currentIndent.length);
+				}
 				continue;
 			}
 			const targetWidth = Math.max(0, entry.indentWidth + delta);
@@ -193,6 +279,7 @@ export interface CascadeOptions {
 	cascadeRestore: boolean;
 	dateStamp: string | null;
 	sortOrder: "append" | "prepend";
+	completedParentBehavior: "none" | "move" | "stay";
 }
 
 export interface CascadeResult {
@@ -294,14 +381,45 @@ function matchingNode(
 	incoming: TaskTreeNode,
 	options: CascadeOptions
 ): TaskTreeNode | null {
-	const text = normalizedText(incoming);
 	for (const entry of entries) {
-		if (!isTreeNode(entry) || normalizedText(entry) !== text) continue;
+		if (!isTreeNode(entry) || !nodeMatches(entry, incoming)) continue;
 		const incomingContext = isContextNode(incoming, options.contextStatus);
 		const existingContext = isContextNode(entry, options.contextStatus);
 		if (incomingContext || existingContext || entry.state === incoming.state) return entry;
 	}
 	return null;
+}
+
+function insertNodeInOriginalOrder(entries: TreeEntry[], node: TaskTreeNode): void {
+	const order = taskOrder(node);
+	if (order === null) {
+		entries.push(node);
+		return;
+	}
+	const next = entries.findIndex((entry) =>
+		isTreeNode(entry) && compareOrders(taskOrder(entry), order) > 0
+	);
+	if (next === -1) entries.push(node);
+	else entries.splice(next, 0, node);
+}
+
+function compareOrders(left: string | null, right: string): number {
+	if (left === null) return 1;
+	const a = left.split(".").map(Number);
+	const b = right.split(".").map(Number);
+	for (let index = 0; index < Math.max(a.length, b.length); index++) {
+		if (index >= a.length) return -1;
+		if (index >= b.length) return 1;
+		if (a[index] !== b[index]) return a[index] - b[index];
+	}
+	return 0;
+}
+
+function setTaskOrder(node: TaskTreeNode, order: string): void {
+	const marker = `${ORDER_MARKER_PREFIX}${order}%%`;
+	if (ORDER_MARKER.test(node.line)) node.line = node.line.replace(ORDER_MARKER, marker);
+	else appendMarker(node, marker);
+	refreshNode(node);
 }
 
 function mergeNode(
@@ -333,6 +451,13 @@ function mergeNode(
 			const firstNode = existing.entries.findIndex(isTreeNode);
 			existing.entries.splice(firstNode === -1 ? existing.entries.length : firstNode, 0, entry);
 		} else existing.entries.push(entry);
+	}
+	if (
+		!isContextNode(existing, options.contextStatus) &&
+		isChecked(existing) &&
+		existing.entries.some((entry) => isTreeNode(entry) && entry.state !== null)
+	) {
+		appendMarker(existing, CASCADE_MARKER);
 	}
 }
 
@@ -366,7 +491,11 @@ function moveCompletedFromContainer(
 			continue;
 		}
 
-		if (isChecked(entry) && !isContextNode(entry, options.contextStatus)) {
+		if (
+			isChecked(entry) &&
+			!isContextNode(entry, options.contextStatus) &&
+			!entry.line.includes(AUTO_STAY_MARKER)
+		) {
 			cascadeComplete(entry, options);
 			mergeArchiveBranch(completed, archiveBranch(ancestors, entry, options), options);
 			entries.splice(index, 1);
@@ -384,6 +513,7 @@ function moveCompletedFromContainer(
 		if (
 			childMoves > 0 &&
 			!options.keepEmptyParents &&
+			options.completedParentBehavior === "none" &&
 			entry.state !== null &&
 			!hasChildItems(entry)
 		) {
@@ -411,10 +541,10 @@ function mergeActiveNode(existing: TaskTreeNode, incoming: TaskTreeNode): void {
 			continue;
 		}
 		const match = existing.entries.find((candidate) =>
-			isTreeNode(candidate) && normalizedText(candidate) === normalizedText(entry)
+			isTreeNode(candidate) && nodeMatches(candidate, entry)
 		) as TaskTreeNode | undefined;
 		if (match) mergeActiveNode(match, entry);
-		else existing.entries.push(entry);
+		else insertNodeInOriginalOrder(existing.entries, entry);
 	}
 }
 
@@ -425,9 +555,8 @@ function mergeIntoActive(
 ): void {
 	let destination = main;
 	for (const context of contexts) {
-		const text = normalizedText(context);
 		let parent = destination.find((entry) =>
-			isTreeNode(entry) && normalizedText(entry) === text
+			isTreeNode(entry) && nodeMatches(entry, context)
 		) as TaskTreeNode | undefined;
 		if (!parent) {
 			parent = activeContextClone(context);
@@ -441,10 +570,10 @@ function mergeIntoActive(
 	}
 
 	const match = destination.find((entry) =>
-		isTreeNode(entry) && normalizedText(entry) === normalizedText(restored)
+		isTreeNode(entry) && nodeMatches(entry, restored)
 	) as TaskTreeNode | undefined;
 	if (match) mergeActiveNode(match, restored);
-	else destination.push(restored);
+	else insertNodeInOriginalOrder(destination, restored);
 }
 
 function pruneEmptyContexts(entries: TreeEntry[], options: CascadeOptions): void {
@@ -461,6 +590,133 @@ function pruneEmptyContexts(entries: TreeEntry[], options: CascadeOptions): void
 		}
 		index++;
 	}
+}
+
+function findNodeById(entries: TreeEntry[], id: string): TaskTreeNode | null {
+	for (const entry of entries) {
+		if (!isTreeNode(entry)) continue;
+		if (taskId(entry) === id) return entry;
+		const nested = findNodeById(entry.entries, id);
+		if (nested) return nested;
+	}
+	return null;
+}
+
+function updateAutomaticParents(
+	main: TreeEntry[],
+	completed: TreeEntry[],
+	options: CascadeOptions
+): number {
+	if (options.completedParentBehavior === "none") return 0;
+	let changed = 0;
+	const visit = (entries: TreeEntry[]) => {
+		for (const entry of entries) {
+			if (!isTreeNode(entry)) continue;
+			visit(entry.entries);
+			if (entry.state === null || isContextNode(entry, options.contextStatus)) continue;
+
+			const id = taskId(entry);
+			const archived = id ? findNodeById(completed, id) : null;
+			const activeChildren = entry.entries.filter(isTreeNode).filter((child) => child.state !== null);
+			const archivedChildren = archived
+				? archived.entries.filter(isTreeNode).filter((child) => child.state !== null)
+				: [];
+			const hasKnownChildren = activeChildren.length > 0 || archivedChildren.length > 0;
+			const allCompleted = hasKnownChildren && activeChildren.every((child) => isChecked(child));
+
+			if (allCompleted && !isChecked(entry)) {
+				setTaskState(entry, "x");
+				if (options.completedParentBehavior === "stay") {
+					appendMarker(entry, AUTO_STAY_MARKER);
+					stamp(entry, options.dateStamp);
+				}
+				changed++;
+			} else if (!allCompleted && entry.line.includes(AUTO_STAY_MARKER)) {
+				setTaskState(entry, " ");
+				removeMarker(entry, AUTO_STAY_MARKER);
+				stripTaskMetadata(entry);
+				changed++;
+			}
+		}
+	};
+	visit(main);
+	return changed;
+}
+
+export function taskIdAtOrdinal(entries: TreeEntry[], ordinal: number): string | null {
+	let current = 0;
+	let result: string | null = null;
+	const visit = (items: TreeEntry[]) => {
+		for (const entry of items) {
+			if (!isTreeNode(entry) || result) continue;
+			if (current === ordinal) {
+				result = taskId(entry);
+				return;
+			}
+			current++;
+			visit(entry.entries);
+		}
+	};
+	visit(entries);
+	return result;
+}
+
+export interface DeleteTaskResult {
+	main: TreeEntry[];
+	completed: TreeEntry[];
+	deleted: boolean;
+	promoted: boolean;
+}
+
+export function deleteTaskCascadeTrees(
+	main: TreeEntry[],
+	completed: TreeEntry[],
+	targetId: string,
+	behavior: "cascade" | "promote",
+	options: CascadeOptions
+): DeleteTaskResult {
+	ensureCascadeMetadata(main, completed, options.contextStatus);
+	const occurrences = [findNodeById(main, targetId), findNodeById(completed, targetId)]
+		.filter((node): node is TaskTreeNode => node !== null);
+	const hasChildren = occurrences.some(hasChildItems);
+	const promote = hasChildren && behavior === "promote";
+	let deleted = false;
+
+	const remove = (entries: TreeEntry[]) => {
+		for (let index = 0; index < entries.length;) {
+			const entry = entries[index];
+			if (!isTreeNode(entry)) {
+				index++;
+				continue;
+			}
+			if (taskId(entry) !== targetId) {
+				remove(entry.entries);
+				index++;
+				continue;
+			}
+
+			deleted = true;
+			if (!promote) {
+				entries.splice(index, 1);
+				continue;
+			}
+
+			const children = entry.entries.filter(isTreeNode);
+			const parentOrder = taskOrder(entry) ?? String(index);
+			for (let childIndex = 0; childIndex < children.length; childIndex++) {
+				const child = children[childIndex];
+				setTaskOrder(child, `${parentOrder}.${taskOrder(child) ?? childIndex}`);
+				reindentNode(child, entry.indent);
+			}
+			entries.splice(index, 1, ...children);
+			index += children.length;
+		}
+	};
+
+	remove(main);
+	remove(completed);
+	pruneEmptyContexts(completed, options);
+	return { main, completed, deleted, promoted: promote };
 }
 
 function restoreFromContainer(
@@ -489,7 +745,16 @@ function restoreFromContainer(
 		}
 
 		if (!isRestorable(entry, options)) {
-			restoredCount += restoreFromContainer(entry.entries, contexts, main, options);
+			// A real completed parent is still part of the path of an unchecked
+			// descendant. Keeping it in the context chain lets that descendant be
+			// reconstructed under the right parent even before the parent itself is
+			// restored.
+			restoredCount += restoreFromContainer(
+				entry.entries,
+				entry.state !== null ? [...contexts, entry] : contexts,
+				main,
+				options
+			);
 			index++;
 			continue;
 		}
@@ -526,9 +791,14 @@ export function synchronizeCascadeTrees(
 	completed: TreeEntry[],
 	options: CascadeOptions
 ): CascadeResult {
+	ensureCascadeMetadata(main, completed, options.contextStatus);
 	const restored = restoreFromContainer(completed, [], main, options);
 	pruneEmptyContexts(completed, options);
-	const moved = moveCompletedFromContainer(main, [], completed, options);
+	let moved = moveCompletedFromContainer(main, [], completed, options);
+	updateAutomaticParents(main, completed, options);
+	if (options.completedParentBehavior === "move") {
+		moved += moveCompletedFromContainer(main, [], completed, options);
+	}
 	pruneEmptyContexts(completed, options);
 	return { main, completed, moved, restored };
 }
@@ -538,7 +808,12 @@ export function moveCompletedCascadeTrees(
 	completed: TreeEntry[],
 	options: CascadeOptions
 ): CascadeResult {
-	const moved = moveCompletedFromContainer(main, [], completed, options);
+	ensureCascadeMetadata(main, completed, options.contextStatus);
+	let moved = moveCompletedFromContainer(main, [], completed, options);
+	updateAutomaticParents(main, completed, options);
+	if (options.completedParentBehavior === "move") {
+		moved += moveCompletedFromContainer(main, [], completed, options);
+	}
 	pruneEmptyContexts(completed, options);
 	return { main, completed, moved, restored: 0 };
 }
@@ -548,7 +823,9 @@ export function restoreUncheckedCascadeTrees(
 	completed: TreeEntry[],
 	options: CascadeOptions
 ): CascadeResult {
+	ensureCascadeMetadata(main, completed, options.contextStatus);
 	const restored = restoreFromContainer(completed, [], main, options);
+	updateAutomaticParents(main, completed, options);
 	pruneEmptyContexts(completed, options);
 	return { main, completed, moved: 0, restored };
 }
@@ -558,6 +835,7 @@ export function restoreAllCascadeTrees(
 	completed: TreeEntry[],
 	options: CascadeOptions
 ): CascadeResult {
+	ensureCascadeMetadata(main, completed, options.contextStatus);
 	const markRestorable = (entries: TreeEntry[]) => {
 		for (const entry of entries) {
 			if (!isTreeNode(entry)) continue;

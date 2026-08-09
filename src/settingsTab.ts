@@ -121,7 +121,7 @@ export class CheckSortedSettingTab extends PluginSettingTab {
 			new Setting(areaSection)
 				.setName("Context checkbox status")
 				.setDesc(
-					"One character used for dim, non-interactive parent copies in the completed area. Space, x, X, and / are reserved. Default: c."
+					"One character used internally for hidden structural parent copies in the completed area. Space, x, X, and / are reserved. Default: c."
 				)
 				.addText((text) => {
 					text.inputEl.maxLength = 1;
@@ -264,6 +264,43 @@ export class CheckSortedSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.cascadeRestore)
 					.onChange(async (value) => {
 						this.plugin.settings.cascadeRestore = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(autoSection)
+			.setName("When all child tasks are completed")
+			.setDesc(
+				"Choose whether the parent stays open, is completed and moved normally, or is completed in place."
+			)
+			.addDropdown((drop) =>
+				drop
+					.addOptions({
+						none: "Leave parent open",
+						move: "Complete and move parent",
+						stay: "Complete parent in place",
+					})
+					.setValue(this.plugin.settings.completedParentBehavior)
+					.onChange(async (value: "none" | "move" | "stay") => {
+						this.plugin.settings.completedParentBehavior = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(autoSection)
+			.setName("When deleting a parent task")
+			.setDesc(
+				"Apply this only when the deleted task has child tasks, including children already in the completed area."
+			)
+			.addDropdown((drop) =>
+				drop
+					.addOptions({
+						cascade: "Delete parent and children",
+						promote: "Delete parent only and promote children",
+					})
+					.setValue(this.plugin.settings.parentDeleteBehavior)
+					.onChange(async (value: "cascade" | "promote") => {
+						this.plugin.settings.parentDeleteBehavior = value;
 						await this.plugin.saveSettings();
 					})
 			);
