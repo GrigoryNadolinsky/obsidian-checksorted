@@ -5,10 +5,12 @@ import {
 	EditorSuggest,
 	EditorSuggestContext,
 	EditorSuggestTriggerInfo,
+	MarkdownRenderChild,
 	MarkdownView,
 	moment,
 	Notice,
 	Plugin,
+	TFile,
 } from "obsidian";
 import { RangeSetBuilder } from "@codemirror/state";
 import {
@@ -21,6 +23,26 @@ import {
 } from "@codemirror/view";
 import { CheckSortedSettings, DEFAULT_SETTINGS } from "./settings";
 import { CheckSortedSettingTab } from "./settingsTab";
+import {
+	appendMarker,
+	CASCADE_MARKER,
+	CascadeOptions,
+	CONTEXT_MARKER,
+	indentationWidth,
+	isContextNode,
+	isTreeNode,
+	moveCompletedCascadeTrees,
+	parseTree,
+	reindentNode,
+	restoreAllCascadeTrees,
+	restoreUncheckedCascadeTrees,
+	serializeTree,
+	setTaskState,
+	stripTaskMetadata,
+	synchronizeCascadeTrees,
+	TaskTreeNode,
+	TreeEntry,
+} from "./taskTree";
 
 const RIBBON_ICON = `<g transform="scale(0.33333)">
   <defs>
@@ -42,6 +64,20 @@ const RIBBON_ICON = `<g transform="scale(0.33333)">
   <polyline points="90,200 140,245 250,110" fill="none" stroke="currentColor" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"></polyline>
 </g>`;
 
+const READING_SYNC_DEBOUNCE_MS = 75;
+const READING_SYNC_FALLBACK_MS = 1500;
+
+interface PendingReadingSync {
+	settleTimer: number | null;
+	fallbackTimer: number | null;
+}
+
+interface GlobalTransformResult {
+	content: string;
+	moved: number;
+	restored: number;
+}
+
 export default class CheckSortedPlugin extends Plugin {
 	settings: CheckSortedSettings;
 	ribbonIconEl: HTMLElement | null = null;
@@ -50,10 +86,10 @@ export default class CheckSortedPlugin extends Plugin {
 	private isProcessing = false;
 	private lastCursorLine = -1;
 	private lastCheckboxSnapshot = '';
+	private pendingReadingSyncs = new Map<string, PendingReadingSync>();
+	private processingReadingFiles = new Set<string>();
 
 	private handleCheckboxMouseDown = (evt: MouseEvent) => {
-		if (!(evt.ctrlKey || evt.metaKey)) return;
-
 		const target = evt.target as HTMLElement;
 		if (!target) return;
 
@@ -68,9 +104,6 @@ export default class CheckSortedPlugin extends Plugin {
 		const cm = (editor as any).cm;
 		if (!cm || typeof cm.posAtDOM !== "function") return;
 
-		evt.preventDefault();
-		evt.stopPropagation();
-
 		try {
 			const cmLine = target.closest(".cm-line");
 			if (!cmLine) return;
@@ -78,6 +111,17 @@ export default class CheckSortedPlugin extends Plugin {
 			const pos = cm.posAtDOM(cmLine);
 			const lineNum = editor.offsetToPos(pos).line;
 			const lineText = editor.getLine(lineNum);
+			const contextState = this.settings.contextStatus;
+			const stateMatch = /^\s*(?:[-*+]|\d+\.) \[([^\]])\]/.exec(lineText);
+			if (lineText.includes(CONTEXT_MARKER) || stateMatch?.[1] === contextState) {
+				evt.preventDefault();
+				evt.stopPropagation();
+				return;
+			}
+			if (!(evt.ctrlKey || evt.metaKey)) return;
+
+			evt.preventDefault();
+			evt.stopPropagation();
 
 			const match = /^(\s*[-*+] )\[([ xX\/])\] (.*)$/.exec(lineText);
 			if (match) {
@@ -95,14 +139,13 @@ export default class CheckSortedPlugin extends Plugin {
 	};
 
 	private handleCheckboxClick = (evt: MouseEvent) => {
-		if (!(evt.ctrlKey || evt.metaKey)) return;
-
 		const target = evt.target as HTMLElement;
 		if (!target) return;
 
 		const isCheckboxInput = target.tagName === "INPUT" && (target as HTMLInputElement).type === "checkbox";
 		const isCheckboxClass = target.classList.contains("task-list-item-checkbox");
-		if (isCheckboxInput || isCheckboxClass) {
+		const isContext = !!target.closest(".checksorted-context-line, li.checksorted-context-task");
+		if ((isCheckboxInput || isCheckboxClass) && (isContext || evt.ctrlKey || evt.metaKey)) {
 			evt.preventDefault();
 			evt.stopPropagation();
 		}
@@ -135,7 +178,23 @@ export default class CheckSortedPlugin extends Plugin {
 		this.registerEditorSuggest(new CheckboxSuggest(this));
 		this.registerEditorExtension(deleteButtonExtension(this));
 		this.registerEditorExtension(dateStampExtension(this));
-		this.registerMarkdownPostProcessor((el) => {
+		this.registerEditorExtension(contextTaskExtension(this));
+		this.registerMarkdownPostProcessor((el, ctx) => {
+			decorateReadingContexts(
+				el,
+				this.settings.contextStatus,
+				ctx.getSectionInfo(el)?.text
+			);
+			// Reading view checkboxes are not guaranteed to emit workspace
+			// "editor-change" events. Watch their DOM events on every platform,
+			// then wait for Obsidian's corresponding vault modification before
+			// transforming the file.
+			ctx.addChild(new ReadingViewCheckboxHandler(
+				el,
+				ctx.sourcePath,
+				(path) => this.queueReadingViewSync(path)
+			));
+
 			el.querySelectorAll("li.task-list-item.is-checked").forEach((li) => {
 				const walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT);
 				const hits: { node: Text; idx: number }[] = [];
@@ -157,6 +216,11 @@ export default class CheckSortedPlugin extends Plugin {
 				}
 			});
 		});
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile) this.handleReadingViewFileModified(file);
+			})
+		);
 		this.updateStatusBar();
 		this.setupAutoMove();
 
@@ -167,6 +231,143 @@ export default class CheckSortedPlugin extends Plugin {
 	onunload() {
 		document.removeEventListener("mousedown", this.handleCheckboxMouseDown, true);
 		document.removeEventListener("click", this.handleCheckboxClick, true);
+		for (const pending of this.pendingReadingSyncs.values()) {
+			if (pending.settleTimer !== null) window.clearTimeout(pending.settleTimer);
+			if (pending.fallbackTimer !== null) window.clearTimeout(pending.fallbackTimer);
+		}
+		this.pendingReadingSyncs.clear();
+		this.processingReadingFiles.clear();
+	}
+
+	private queueReadingViewSync(path: string): void {
+		if (!this.settings.autoMove || !path) return;
+
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile) || file.extension.toLowerCase() !== "md") return;
+
+		const existing = this.pendingReadingSyncs.get(path);
+		// A normal activation commonly produces both "click" and "change".
+		// Keep the first pending request; vault modify events still debounce a
+		// burst of genuinely separate taps on the same note.
+		if (existing) return;
+
+		const pending: PendingReadingSync = {
+			settleTimer: null,
+			// Normally vault "modify" starts processing. The fallback covers
+			// platform/version differences where that event is delayed or omitted.
+			fallbackTimer: window.setTimeout(() => {
+				void this.processPendingReadingSync(path);
+			}, READING_SYNC_FALLBACK_MS),
+		};
+		this.pendingReadingSyncs.set(path, pending);
+	}
+
+	private handleReadingViewFileModified(file: TFile): void {
+		const pending = this.pendingReadingSyncs.get(file.path);
+		if (!pending || this.processingReadingFiles.has(file.path)) return;
+
+		if (pending.settleTimer !== null) window.clearTimeout(pending.settleTimer);
+		pending.settleTimer = window.setTimeout(() => {
+			void this.processPendingReadingSync(file.path);
+		}, READING_SYNC_DEBOUNCE_MS);
+	}
+
+	private async processPendingReadingSync(path: string): Promise<void> {
+		const pending = this.pendingReadingSyncs.get(path);
+		if (!pending || this.processingReadingFiles.has(path)) return;
+
+		if (pending.settleTimer !== null) window.clearTimeout(pending.settleTimer);
+		if (pending.fallbackTimer !== null) window.clearTimeout(pending.fallbackTimer);
+		this.pendingReadingSyncs.delete(path);
+
+		if (!this.settings.autoMove) return;
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile) || file.extension.toLowerCase() !== "md") return;
+
+		this.processingReadingFiles.add(path);
+		try {
+			// Avoid a needless write (and therefore a sync round-trip) when the
+			// click did not ultimately change a task or another plugin handled it.
+			const current = await this.app.vault.read(file);
+			const preview = this.transformReadingViewContent(current);
+			if (preview === current) return;
+
+			// Re-read atomically at write time so a concurrent mobile/desktop edit
+			// is transformed rather than overwritten with the earlier snapshot.
+			await this.app.vault.process(file, (latest) =>
+				this.transformReadingViewContent(latest)
+			);
+		} catch (error) {
+			console.error(`CheckSorted: Failed to sync reading-view checkbox in ${path}`, error);
+		} finally {
+			this.processingReadingFiles.delete(path);
+			// A second tap may have arrived while this file was being processed.
+			if (this.pendingReadingSyncs.has(path)) {
+				const next = this.pendingReadingSyncs.get(path)!;
+				if (next.settleTimer !== null) window.clearTimeout(next.settleTimer);
+				next.settleTimer = window.setTimeout(() => {
+					void this.processPendingReadingSync(path);
+				}, READING_SYNC_DEBOUNCE_MS);
+			}
+		}
+	}
+
+	private transformReadingViewContent(content: string): string {
+		if (this.settings.sortMethod === "in-place") {
+			return this.sortItemsInPlaceContent(content);
+		}
+		return this.transformGlobalContent(content, "sync").content;
+	}
+
+	private getCascadeOptions(): CascadeOptions {
+		return {
+			contextStatus: this.settings.contextStatus,
+			keepEmptyParents: this.settings.keepEmptyParents,
+			cascadeRestore: this.settings.cascadeRestore,
+			dateStamp: this.settings.dateStamp
+				? moment().format(this.settings.dateFormat)
+				: null,
+			sortOrder: this.settings.sortOrder,
+		};
+	}
+
+	private transformGlobalContent(
+		content: string,
+		mode: "sync" | "move" | "restore-unchecked" | "restore-all"
+	): GlobalTransformResult {
+		const match = this.getHeaderRegex().exec(content);
+		const mainSource = match
+			? content.substring(0, match.index).trimEnd()
+			: content;
+		const completedSource = match
+			? content.substring(match.index + match[0].length).trimStart()
+			: "";
+		const main = parseTree(mainSource);
+		const completed = parseTree(completedSource);
+		for (const entry of completed) {
+			if (isTreeNode(entry) && entry.indentWidth > 0) reindentNode(entry, "");
+		}
+		const options = this.getCascadeOptions();
+		const result = mode === "sync"
+			? synchronizeCascadeTrees(main, completed, options)
+			: mode === "move"
+				? moveCompletedCascadeTrees(main, completed, options)
+				: mode === "restore-all"
+					? restoreAllCascadeTrees(main, completed, options)
+					: restoreUncheckedCascadeTrees(main, completed, options);
+
+		const newMain = serializeTree(result.main).trimEnd();
+		const newCompleted = serializeTree(result.completed).trim();
+		const newContent = newCompleted
+			? newMain
+				? `${newMain}\n\n${this.getHeaderStr()}\n${newCompleted}`
+				: `${this.getHeaderStr()}\n${newCompleted}`
+			: newMain;
+		return {
+			content: newContent,
+			moved: result.moved,
+			restored: result.restored,
+		};
 	}
 
 	updateRibbonIcon(): void {
@@ -273,82 +474,16 @@ export default class CheckSortedPlugin extends Plugin {
 	}
 
 	private getCheckboxSnapshot(content: string): string {
-		return (content.match(/^[ \t]*[-*+] \[[xX \/]\]/gm) ?? []).join('');
+		return (content.match(/^[ \t]*(?:[-*+]|\d+\.) \[[xX \/]\]/gm) ?? []).join('');
 	}
 
-	// cleanEmpty=true: also discard empty "- [ ] " continuation lines (called on exit from completed).
-	// cleanEmpty=false: only return items with real content (called on checkbox toggle).
-	private returnUncheckedItems(editor: Editor, cleanEmpty = false): void {
+	private returnUncheckedItems(editor: Editor, _cleanEmpty = false): void {
 		if (this.isProcessing) return;
-
 		const content = editor.getValue();
-		const headerRegex = this.getHeaderRegex();
-		const match = headerRegex.exec(content);
-
-		if (!match) return;
-
-		const main = content.substring(0, match.index).trimEnd();
-		const rawAfterHeader = content.substring(match.index + match[0].length);
-		const afterHeader = rawAfterHeader.trimStart();
-
-		// With cleanEmpty, .* also catches empty "- [ ] " continuation lines.
-		const uncheckedRegex = cleanEmpty
-			? /^([ \t]*[-*+] \[[ \/]\] .*)\r?\n?/gm
-			: /^([ \t]*[-*+] \[[ \/]\] .+)\r?\n?/gm;
-		const uncheckedMatches = [...afterHeader.matchAll(uncheckedRegex)];
-
-		if (uncheckedMatches.length === 0) return;
-
-		// Also strip any empty "- [ ] " continuation lines that Obsidian inserts when
-		// Enter is pressed on an unchecked item. Otherwise a stray empty checkbox is left
-		// behind in the completed section and renders with a bullet (● ☐).
-		const cleanedSection = afterHeader
-			.replace(uncheckedRegex, "")
-			.replace(/^[ \t]*[-*+] \[[ \/]\][ \t]*(\r?\n|$)/gm, "")
-			.trimEnd();
-
-		const hasContent = /^[ \t]*[-*+] \[[ \/]\] \S/;
-		const returnedItems = uncheckedMatches
-			.filter((m) => hasContent.test(m[1]))
-			.map((m) => m[1].replace(/\s*✅.*$/, ""));
-
-		const newMain =
-			returnedItems.length > 0
-				? main
-					? `${main}\n${returnedItems.join("\n")}`
-					: returnedItems.join("\n")
-				: main;
-		const newContent = cleanedSection
-			? `${newMain}\n\n${this.getHeaderStr()}\n${cleanedSection}`
-			: newMain;
-
-		// Cursor adjustment: start from pre-change cursor, subtract lines removed above it
-		// (in completed), add lines inserted into main before it (returned items, only relevant
-		// when cursor is already in completed and the section shifts down).
-		const preCursorLine = editor.getCursor().line;
-		const headerLine = content.substring(0, match.index).split("\n").length - 1;
-		const cursorInCompleted = preCursorLine > headerLine;
-
-		const leadingTrim = rawAfterHeader.length - afterHeader.length;
-		const afterHeaderDocLine =
-			content.substring(0, match.index + match[0].length + leadingTrim).split("\n").length - 1;
-
-		// Use the same predicate as uncheckedRegex so we only count actually-removed lines.
-		const removedPredicate = cleanEmpty
-			? /^[ \t]*[-*+] \[[ \/]\] /
-			: /^[ \t]*[-*+] \[[ \/]\] \S/;
-		const removedAboveCursor = afterHeader
-			.split("\n")
-			.slice(0, Math.max(0, preCursorLine - afterHeaderDocLine))
-			.filter((l) => removedPredicate.test(l)).length;
-
-		const cursorLine = Math.max(
-			0,
-			preCursorLine - removedAboveCursor + (cursorInCompleted ? returnedItems.length : 0)
-		);
-
+		const result = this.transformGlobalContent(content, "restore-unchecked");
+		if (result.restored === 0 || result.content === content) return;
 		this.isProcessing = true;
-		this.setValuePreservingScroll(editor, newContent, cursorLine);
+		this.setValuePreservingScroll(editor, result.content, editor.getCursor().line);
 		this.isProcessing = false;
 	}
 
@@ -399,52 +534,13 @@ export default class CheckSortedPlugin extends Plugin {
 
 		const content = editor.getValue();
 		const cursor = editor.getCursor();
-		const { main, completedItems: existing } = this.splitContent(content);
-
-		const completedRegex = /^([ \t]*[-*+] \[[xX]\] \S.*)\r?\n?/gm;
-		const newItems = [...main.matchAll(completedRegex)].map((m) => m[1]);
-
-		if (newItems.length === 0) {
+		const result = this.transformGlobalContent(content, "move");
+		if (result.moved === 0 || result.content === content) {
 			if (!silent) new Notice("No completed items to move.");
 			return;
 		}
-
-		// Count [x] lines removed above the cursor so we can land on the right line
-		const singleItemRegex = /^[ \t]*[-*+] \[[xX]\] \S.*/;
-		const mainLines = main.split("\n");
-		let removedAbove = 0;
-		for (let i = 0; i < Math.min(cursor.line, mainLines.length); i++) {
-			if (singleItemRegex.test(mainLines[i])) removedAbove++;
-		}
-
-		const stamped = newItems.map((item) => {
-			if (this.settings.dateStamp && !/ ✅ \S/.test(item)) {
-				return `${item} ✅ ${moment().format(this.settings.dateFormat)}`;
-			}
-			return item;
-		});
-		const allItems =
-			this.settings.sortOrder === "prepend"
-				? [...stamped, ...existing]
-				: [...existing, ...stamped];
-
-		const cleanMain = main
-			.replace(completedRegex, "")
-			.replace(/^[ \t]*[-*+] \[[xX ]\] [ \t]*$/gm, "")
-			.replace(/\n{3,}/g, "\n\n")
-			.trimEnd();
-
-		const completedSection = `${this.getHeaderStr()}\n${allItems.join("\n")}`;
-		const newContent = cleanMain
-			? `${cleanMain}\n\n${completedSection}`
-			: completedSection;
-
 		this.isProcessing = true;
-		this.setValuePreservingScroll(
-			editor,
-			newContent,
-			Math.max(0, cursor.line - removedAbove)
-		);
+		this.setValuePreservingScroll(editor, result.content, cursor.line);
 		this.isProcessing = false;
 	}
 
@@ -488,123 +584,76 @@ export default class CheckSortedPlugin extends Plugin {
 	}
 
 	private sortItemsInPlaceContent(content: string): string {
-		const lines = content.split("\n");
-		let outLines: string[] = [];
-		const listItemRegex = /^([ \t]*)([-*+]|\d+\.) (?:\[([ xX\/])\] )?(.*)$/;
+		const tree = parseTree(content);
+		const contextStatus = this.settings.contextStatus;
+		const date = this.settings.dateStamp
+			? moment().format(this.settings.dateFormat)
+			: null;
 
-		interface Node {
-			indent: number;
-			originalLine: string;
-			state: number; // 0=unchecked/none, 1=half, 2=checked
-			children: Node[];
-			isContinuation: boolean;
-			order: number;
-		}
-
-		let i = 0;
-		while (i < lines.length) {
-			if (listItemRegex.test(lines[i])) {
-				let blockLines: string[] = [];
-				while (i < lines.length) {
-					const line = lines[i];
-					if (line.trim() === "") {
-						let nextNonEmpty = i + 1;
-						while (nextNonEmpty < lines.length && lines[nextNonEmpty].trim() === "") nextNonEmpty++;
-						if (nextNonEmpty < lines.length) {
-							const nextLine = lines[nextNonEmpty];
-							const match = listItemRegex.exec(nextLine);
-							const isIndented = /^[ \t]+/.test(nextLine);
-							if (match || isIndented) {
-								blockLines.push(line);
-								i++;
-								continue;
-							}
-						}
-						break;
-					}
-					const match = listItemRegex.exec(line);
-					const isIndented = /^[ \t]+/.test(line);
-					if (match || isIndented) {
-						blockLines.push(line);
-						i++;
-					} else {
-						break;
-					}
-				}
-
-				const root: Node = { indent: -1, originalLine: "", state: 0, children: [], isContinuation: false, order: 0 };
-				const stack: Node[] = [root];
-
-				for (let j = 0; j < blockLines.length; j++) {
-					let line = blockLines[j];
-					const match = listItemRegex.exec(line);
-					if (match) {
-						const indent = match[1].length;
-						const checkbox = match[3];
-						let state = 0;
-						if (checkbox === "/") state = 1;
-						else if (checkbox === "x" || checkbox === "X") {
-							state = 2;
-							if (this.settings.dateStamp && !/ ✅ \S/.test(line)) {
-								line = line + ` ✅ ${moment().format(this.settings.dateFormat)}`;
-							}
-						}
-
-						const node: Node = {
-							indent,
-							originalLine: line,
-							state,
-							children: [],
-							isContinuation: false,
-							order: j
-						};
-
-						while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
-							stack.pop();
-						}
-
-						stack[stack.length - 1].children.push(node);
-						stack.push(node);
-					} else {
-						const node: Node = {
-							indent: Infinity,
-							originalLine: line,
-							state: 0,
-							children: [],
-							isContinuation: true,
-							order: j
-						};
-						stack[stack.length - 1].children.push(node);
-					}
-				}
-
-				const sortNode = (node: Node) => {
-					node.children.sort((a, b) => {
-						if (a.isContinuation && !b.isContinuation) return -1;
-						if (!a.isContinuation && b.isContinuation) return 1;
-						if (a.state !== b.state) return a.state - b.state;
-						return a.order - b.order;
-					});
-					for (const child of node.children) {
-						sortNode(child);
-					}
-				};
-
-				sortNode(root);
-
-				const flatten = (node: Node) => {
-					for (const child of node.children) {
-						outLines.push(child.originalLine);
-						flatten(child);
-					}
-				};
-				flatten(root);
-			} else {
-				outLines.push(lines[i]);
-				i++;
+		const stamp = (node: TaskTreeNode) => {
+			if (date && !/ ✅ \S/.test(node.line)) {
+				node.line = `${node.line.trimEnd()} ✅ ${date}`;
 			}
-		}
-		return outLines.join("\n");
+		};
+		const uncheckSubtree = (node: TaskTreeNode) => {
+			if (node.state !== null && !isContextNode(node, contextStatus)) {
+				setTaskState(node, " ");
+				stripTaskMetadata(node);
+			}
+			for (const child of node.entries) {
+				if (isTreeNode(child)) uncheckSubtree(child);
+			}
+		};
+		const completeDescendants = (node: TaskTreeNode): number => {
+			let count = 0;
+			for (const child of node.entries) {
+				if (!isTreeNode(child)) continue;
+				if (child.state !== null && !isContextNode(child, contextStatus)) {
+					setTaskState(child, "x");
+					stamp(child);
+					count++;
+				}
+				count += completeDescendants(child);
+			}
+			return count;
+		};
+		const rank = (node: TaskTreeNode): number => {
+			if (isContextNode(node, contextStatus)) return 2;
+			if (node.state === "/") return 1;
+			if (node.state === "x" || node.state === "X") return 2;
+			return 0;
+		};
+		const visit = (entries: TreeEntry[]) => {
+			for (const entry of entries) {
+				if (!isTreeNode(entry)) continue;
+				const checked = entry.state === "x" || entry.state === "X";
+				if (checked && !isContextNode(entry, contextStatus)) {
+					stamp(entry);
+					if (completeDescendants(entry) > 0) appendMarker(entry, CASCADE_MARKER);
+				} else if (entry.line.includes(CASCADE_MARKER)) {
+					if (this.settings.cascadeRestore) uncheckSubtree(entry);
+					else stripTaskMetadata(entry);
+				}
+				visit(entry.entries);
+			}
+
+			// Sort only adjacent sibling items. A heading, paragraph, or other
+			// root-level text separates independent Markdown list blocks.
+			for (let start = 0; start < entries.length;) {
+				if (!isTreeNode(entries[start])) {
+					start++;
+					continue;
+				}
+				let end = start + 1;
+				while (end < entries.length && isTreeNode(entries[end])) end++;
+				const sorted = (entries.slice(start, end) as TaskTreeNode[])
+					.sort((a, b) => rank(a) - rank(b));
+				entries.splice(start, sorted.length, ...sorted);
+				start = end;
+			}
+		};
+		visit(tree);
+		return serializeTree(tree);
 	}
 
 	// Called by CheckboxSuggest when an autocomplete suggestion is accepted.
@@ -669,48 +718,48 @@ export default class CheckSortedPlugin extends Plugin {
 		}
 
 		const content = editor.getValue();
-		const { main, completedItems } = this.splitContent(content);
-
-		if (completedItems.length === 0) {
+		const result = this.transformGlobalContent(content, "restore-all");
+		if (result.restored === 0 || result.content === content) {
 			new Notice("No completed items to restore.");
 			return;
 		}
 
-		const restored = completedItems.map((item) =>
-			item.replace(/\[[xX]\]/, "[ ]").replace(/\s*✅.*$/, "")
-		);
-
 		this.isProcessing = true;
-		this.setValuePreservingScroll(editor, `${main}\n${restored.join("\n")}`.trim());
+		this.setValuePreservingScroll(editor, result.content);
 		this.isProcessing = false;
 
 		new Notice(
-			`Restored ${completedItems.length} item${
-				completedItems.length !== 1 ? "s" : ""
+			`Restored ${result.restored} item${
+				result.restored !== 1 ? "s" : ""
 			}.`
 		);
 	}
 
 	private restoreCompletedItemsInPlace(editor: Editor): void {
-		const content = editor.getValue();
-		const lines = content.split("\n");
+		const tree = parseTree(editor.getValue());
 		let count = 0;
-		const lineRegex = /^([ \t]*[-*+] )\[[xX\/]\] (.*)$/;
-		for (let i = 0; i < lines.length; i++) {
-			const match = lineRegex.exec(lines[i]);
-			if (match) {
-				const prefix = match[1];
-				const rest = match[2].replace(/\s*✅.*$/, "");
-				lines[i] = `${prefix}[ ] ${rest}`;
-				count++;
+		const restore = (entries: TreeEntry[]) => {
+			for (const entry of entries) {
+				if (!isTreeNode(entry)) continue;
+				if (
+					entry.state !== null &&
+					!isContextNode(entry, this.settings.contextStatus) &&
+					entry.state !== " "
+				) {
+					setTaskState(entry, " ");
+					stripTaskMetadata(entry);
+					count++;
+				}
+				restore(entry.entries);
 			}
-		}
+		};
+		restore(tree);
 		if (count === 0) {
 			new Notice("No completed or half-completed items to restore.");
 			return;
 		}
 		this.isProcessing = true;
-		this.setValuePreservingScroll(editor, lines.join("\n"));
+		this.setValuePreservingScroll(editor, serializeTree(tree));
 		this.isProcessing = false;
 		new Notice(`Restored ${count} item${count !== 1 ? "s" : ""}.`);
 	}
@@ -741,48 +790,38 @@ export default class CheckSortedPlugin extends Plugin {
 	}
 
 	private clearCompletedItemsInPlace(editor: Editor): void {
-		const content = editor.getValue();
-		const lines = content.split("\n");
-		const newLines: string[] = [];
+		const tree = parseTree(editor.getValue());
 		let count = 0;
-		const checkedRegex = /^[ \t]*[-*+] \[[xX]\]/;
-		for (let i = 0; i < lines.length; i++) {
-			if (checkedRegex.test(lines[i])) {
-				count++;
-				const baseIndentMatch = /^[ \t]*/.exec(lines[i]);
-				const baseIndent = baseIndentMatch ? baseIndentMatch[0].length : 0;
-				while (i + 1 < lines.length) {
-					const nextLine = lines[i + 1];
-					if (nextLine.trim() === "") {
-						let nextNonEmpty = i + 2;
-						while (nextNonEmpty < lines.length && lines[nextNonEmpty].trim() === "") nextNonEmpty++;
-						if (nextNonEmpty < lines.length && /^[ \t]+/.test(lines[nextNonEmpty])) {
-							const nextIndent = /^[ \t]*/.exec(lines[nextNonEmpty])![0].length;
-							if (nextIndent > baseIndent) {
-								i = nextNonEmpty;
-								continue;
-							}
-						}
-						break;
-					}
-					const isListItem = /^[ \t]*[-*+]/.test(nextLine);
-					const nextIndent = /^[ \t]*/.exec(nextLine)![0].length;
-					if (!isListItem && nextIndent > baseIndent) {
-						i++;
-					} else {
-						break;
-					}
+		const removeChecked = (entries: TreeEntry[]) => {
+			for (let index = 0; index < entries.length;) {
+				const entry = entries[index];
+				if (!isTreeNode(entry)) {
+					index++;
+					continue;
 				}
-			} else {
-				newLines.push(lines[i]);
+				if (
+					!isContextNode(entry, this.settings.contextStatus) &&
+					(entry.state === "x" || entry.state === "X")
+				) {
+					const countTasks = (node: TaskTreeNode): number =>
+						(node.state === "x" || node.state === "X" ? 1 : 0) +
+						node.entries.reduce((sum, child) =>
+							sum + (isTreeNode(child) ? countTasks(child) : 0), 0);
+					count += countTasks(entry);
+					entries.splice(index, 1);
+					continue;
+				}
+				removeChecked(entry.entries);
+				index++;
 			}
-		}
+		};
+		removeChecked(tree);
 		if (count === 0) {
 			new Notice("No completed items to clear.");
 			return;
 		}
 		this.isProcessing = true;
-		this.setValuePreservingScroll(editor, newLines.join("\n"));
+		this.setValuePreservingScroll(editor, serializeTree(tree));
 		this.isProcessing = false;
 		new Notice(`Cleared ${count} completed item${count !== 1 ? "s" : ""}.`);
 	}
@@ -809,6 +848,12 @@ export default class CheckSortedPlugin extends Plugin {
 	async loadSettings() {
 		const stored = (await this.loadData()) as Partial<CheckSortedSettings> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, stored);
+		if (
+			this.settings.contextStatus.length !== 1 ||
+			[" ", "x", "X", "/", "[", "]"].includes(this.settings.contextStatus)
+		) {
+			this.settings.contextStatus = DEFAULT_SETTINGS.contextStatus;
+		}
 	}
 
 	async saveSettings() {
@@ -824,6 +869,45 @@ interface CheckboxSuggestion {
 	text: string;
 	checked: boolean;
 	line: number;
+}
+
+// A lifecycle-managed delegated listener for checkboxes rendered in Reading
+// view. "click" is the cross-platform activation event for mouse, touch, pen,
+// and keyboard; "change" is a fallback for hosts that replace the input while
+// handling the click. Repeated signals are coalesced by queueReadingViewSync.
+class ReadingViewCheckboxHandler extends MarkdownRenderChild {
+	constructor(
+		containerEl: HTMLElement,
+		private sourcePath: string,
+		private onCheckboxActivated: (path: string) => void
+	) {
+		super(containerEl);
+	}
+
+	private handleActivation = (event: Event): void => {
+		const target = event.target;
+		if (!(target instanceof Element)) return;
+
+		const checkbox = target.closest("input.task-list-item-checkbox");
+		if (!checkbox || !this.containerEl.contains(checkbox)) return;
+		if (checkbox.closest("li.checksorted-context-task")) {
+			event.preventDefault();
+			event.stopPropagation();
+			return;
+		}
+
+		this.onCheckboxActivated(this.sourcePath);
+	};
+
+	onload(): void {
+		this.containerEl.addEventListener("click", this.handleActivation, true);
+		this.containerEl.addEventListener("change", this.handleActivation, true);
+	}
+
+	onunload(): void {
+		this.containerEl.removeEventListener("click", this.handleActivation, true);
+		this.containerEl.removeEventListener("change", this.handleActivation, true);
+	}
 }
 
 // Autocomplete for checkbox tasks: while typing in a checkbox, suggest tasks
@@ -918,16 +1002,30 @@ class DeleteTaskWidget extends WidgetType {
 			text: "×",
 			attr: { "aria-label": "Delete task" },
 		});
-		btn.addEventListener("mousedown", (e) => {
+		btn.addEventListener("pointerdown", (e) => {
 			// Stop the editor from moving the cursor / starting a selection.
 			e.preventDefault();
 			e.stopPropagation();
 			const pos = view.posAtDOM(btn);
 			const line = view.state.doc.lineAt(pos);
-			const isLast = line.to >= view.state.doc.length;
-			// Remove the line and one adjacent newline so no blank gap remains.
+			const indent = /^[ \t]*/.exec(line.text)?.[0] ?? "";
+			const baseWidth = indentationWidth(indent);
+			let lastIncluded = line;
+
+			// A task owns every following non-empty line with a deeper indent.
+			// Blank lines between owned lines are included by the final range, while
+			// spacing before the next sibling remains untouched.
+			for (let number = line.number + 1; number <= view.state.doc.lines; number++) {
+				const candidate = view.state.doc.line(number);
+				if (candidate.text.trim() === "") continue;
+				const candidateIndent = /^[ \t]*/.exec(candidate.text)?.[0] ?? "";
+				if (indentationWidth(candidateIndent) <= baseWidth) break;
+				lastIncluded = candidate;
+			}
+
+			const isLast = lastIncluded.to >= view.state.doc.length;
 			const from = isLast && line.from > 0 ? line.from - 1 : line.from;
-			const to = isLast ? line.to : line.to + 1;
+			const to = isLast ? lastIncluded.to : lastIncluded.to + 1;
 			view.dispatch({ changes: { from, to, insert: "" } });
 		});
 		return btn;
@@ -940,6 +1038,90 @@ class DeleteTaskWidget extends WidgetType {
 	ignoreEvent(): boolean {
 		return true;
 	}
+}
+
+function decorateReadingContexts(
+	el: HTMLElement,
+	contextStatus: string,
+	sectionSource?: string
+): void {
+	const items = el.querySelectorAll<HTMLElement>("li.task-list-item");
+	const sourceTasks = (sectionSource ?? "")
+		.split("\n")
+		.filter((line) => /^\s*(?:[-*+]|\d+\.) \[[^\]]\]\s/.test(line));
+	items.forEach((item, index) => {
+		const checkbox = Array.from(
+			item.querySelectorAll<HTMLInputElement>("input.task-list-item-checkbox")
+		).find((candidate) => candidate.closest("li.task-list-item") === item);
+		if (!checkbox) return;
+
+		let hasMarker = false;
+		const walker = document.createTreeWalker(item, NodeFilter.SHOW_COMMENT);
+		let comment: Comment | null;
+		while ((comment = walker.nextNode() as Comment | null)) {
+			if ((comment.textContent ?? "").includes("checksorted-context")) {
+				hasMarker = true;
+				break;
+			}
+		}
+		const state = item.getAttribute("data-task") ?? checkbox.getAttribute("data-task");
+		const sourceLine = sourceTasks[index] ?? "";
+		if (
+			!hasMarker &&
+			!sourceLine.includes(CONTEXT_MARKER) &&
+			state !== contextStatus
+		) return;
+
+		item.addClass("checksorted-context-task");
+		checkbox.checked = true;
+		checkbox.disabled = true;
+		checkbox.tabIndex = -1;
+		checkbox.setAttribute("aria-disabled", "true");
+	});
+}
+
+function contextTaskExtension(plugin: CheckSortedPlugin) {
+	return ViewPlugin.fromClass(
+		class {
+			decorations: DecorationSet;
+
+			constructor(view: EditorView) {
+				this.decorations = this.build(view);
+			}
+
+			update(update: ViewUpdate) {
+				if (update.docChanged || update.viewportChanged) {
+					this.decorations = this.build(update.view);
+				}
+			}
+
+			build(view: EditorView): DecorationSet {
+				const builder = new RangeSetBuilder<Decoration>();
+				for (const { from, to } of view.visibleRanges) {
+					let position = from;
+					while (position <= to) {
+						const line = view.state.doc.lineAt(position);
+						const state = /^\s*(?:[-*+]|\d+\.) \[([^\]])\]/.exec(line.text)?.[1];
+						if (
+							line.text.includes(CONTEXT_MARKER) ||
+							state === plugin.settings.contextStatus
+						) {
+							builder.add(
+								line.from,
+								line.from,
+								Decoration.line({
+									attributes: { class: "checksorted-context-line" },
+								})
+							);
+						}
+						position = line.to + 1;
+					}
+				}
+				return builder.finish();
+			}
+		},
+		{ decorations: (value) => value.decorations }
+	);
 }
 
 // Widget that renders the date stamp as a replaced element so that no
@@ -1010,7 +1192,7 @@ function dateStampExtension(plugin: CheckSortedPlugin) {
 
 // Editor extension that puts a DeleteTaskWidget at the end of every checkbox line.
 function deleteButtonExtension(plugin: CheckSortedPlugin) {
-	const checkbox = /^\s*[-*+] \[[ xX\/]\]\s/;
+	const checkbox = /^\s*(?:[-*+]|\d+\.) \[[^\]]\]\s/;
 
 	return ViewPlugin.fromClass(
 		class {

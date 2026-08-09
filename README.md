@@ -11,7 +11,15 @@ An [Obsidian](https://obsidian.md) plugin that keeps your checkbox lists tidy; c
 
 Check a task and it slips into a **Completed** section at the foot of your note. Do it on demand from the command palette or ribbon, or turn on **auto-move** and watch each task leave the instant you tick it. Uncheck something by mistake? It quietly returns to your active list on its own.
 
+Auto-move works in both editing and Reading view on desktop and mobile. In Reading view, CheckSorted waits for Obsidian to save the checkbox change before reorganizing the note, so taps are handled consistently without racing the file write.
+
 ![Completed tasks moved into their own section](docs/img/move.png)
+
+#### Keep nested tasks together
+
+Completing a child copies its full parent path into the completed area and merges it with an existing matching path. Parent copies use a dim, non-interactive context checkbox (by default `[c]`), while the real completed child remains `[x]`. Completing a parent checks and moves its entire subtree. Unchecking it can restore either the whole subtree or only the parent, depending on your settings.
+
+Indented comments, links, images, and other continuation content travel with their owning task. The one-click delete button is cascading too: deleting a parent removes its complete indented block.
 
 #### Sync both ways in one click
 
@@ -94,11 +102,15 @@ Unchecking an item in the completed area automatically returns it to the main li
 
 | Setting | Default | Description |
 |---|---|---|
+| Sort method | Global completed area | Move completed trees to one archive or sort them in place |
 | Header level | H2 | Heading level for the completed section |
 | Header name | `Completed` | Text of the completed section heading |
+| Keep empty parent items | On | Keep a parent in the active list after its last child moves to the completed area |
+| Context checkbox status | `c` | Custom one-character status for dim, non-interactive parent copies |
 | Show ribbon icon | On | Display the trigger icon in the left sidebar |
 | Show status bar toggle | On | Show `CheckSorted ✓ / ✗` in the bottom status bar — click to toggle auto-move |
 | Auto-move on complete | On | Automatically move items to the completed area when checked |
+| Restore descendants with parent | On | Unchecking a completed parent restores and unchecks its entire subtree |
 | Show delete button | On | Show a × on the right of each checkbox line in the editor; click it to delete that task |
 | Task autocomplete | On | Suggest matching tasks while typing in a checkbox; selecting one moves it to the line you're typing |
 | Date stamp | Off | Append `✅ <date>` when items are moved |

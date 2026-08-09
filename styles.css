@@ -22,6 +22,13 @@
 	background-color: var(--text-error);
 }
 
+@media (hover: none), (pointer: coarse) {
+	.checksorted-delete-task {
+		opacity: 0.55;
+		padding: 2px 8px;
+	}
+}
+
 /* Task autocomplete suggestion */
 .checksorted-suggest-state {
 	opacity: 0.6;
@@ -40,6 +47,46 @@
 .checksorted-date {
 	display: inline-block;
 	text-decoration: none !important;
+}
+
+/* Structural parent copies in the completed area. They look completed but
+   are deliberately dim and cannot be toggled like real tasks. */
+.checksorted-context-line,
+li.checksorted-context-task {
+	color: var(--text-muted);
+}
+
+li.checksorted-context-task li {
+	color: var(--text-normal);
+}
+
+.checksorted-context-line .task-list-item-checkbox,
+li.checksorted-context-task > .task-list-item-checkbox,
+li.checksorted-context-task > p > .task-list-item-checkbox {
+	-webkit-appearance: none;
+	appearance: none;
+	background-color: var(--interactive-accent);
+	border: 1px solid var(--interactive-accent);
+	border-radius: var(--checkbox-radius, 3px);
+	cursor: default;
+	opacity: 0.42;
+	position: relative;
+}
+
+.checksorted-context-line .task-list-item-checkbox::after,
+li.checksorted-context-task > .task-list-item-checkbox::after,
+li.checksorted-context-task > p > .task-list-item-checkbox::after {
+	border-color: var(--text-on-accent);
+	border-style: solid;
+	border-width: 0 2px 2px 0;
+	content: "";
+	display: block;
+	height: 50%;
+	left: 35%;
+	position: absolute;
+	top: 16%;
+	transform: rotate(45deg);
+	width: 25%;
 }
 
 /* Settings tab bar */

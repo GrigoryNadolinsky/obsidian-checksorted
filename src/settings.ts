@@ -10,6 +10,9 @@ export interface CheckSortedSettings {
 	dateFormat: string;
 	sortOrder: "append" | "prepend";
 	sortMethod: "global" | "in-place";
+	keepEmptyParents: boolean;
+	cascadeRestore: boolean;
+	contextStatus: string;
 }
 
 export const DEFAULT_SETTINGS: CheckSortedSettings = {
@@ -24,4 +27,7 @@ export const DEFAULT_SETTINGS: CheckSortedSettings = {
 	dateFormat: "YYYY-MM-DD",
 	sortOrder: "append",
 	sortMethod: "global",
+	keepEmptyParents: true,
+	cascadeRestore: true,
+	contextStatus: "c",
 };

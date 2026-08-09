@@ -103,6 +103,39 @@ export class CheckSortedSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						})
 				);
+
+			new Setting(areaSection)
+				.setName("Keep empty parent items")
+				.setDesc(
+					"Keep a parent in the active list after its last child is moved to the completed area."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.keepEmptyParents)
+						.onChange(async (value) => {
+							this.plugin.settings.keepEmptyParents = value;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(areaSection)
+				.setName("Context checkbox status")
+				.setDesc(
+					"One character used for dim, non-interactive parent copies in the completed area. Space, x, X, and / are reserved. Default: c."
+				)
+				.addText((text) => {
+					text.inputEl.maxLength = 1;
+					text
+						.setPlaceholder("c")
+						.setValue(this.plugin.settings.contextStatus)
+						.onChange(async (value) => {
+							const candidate = value.slice(0, 1);
+							if (!candidate || [" ", "x", "X", "/", "[", "]"].includes(candidate)) return;
+							this.plugin.settings.contextStatus = candidate;
+							await this.plugin.saveSettings();
+							this.app.workspace.updateOptions();
+						});
+				});
 		}
 
 		const dateSection = this.section(el, "Date Stamp");
@@ -218,6 +251,20 @@ export class CheckSortedSettingTab extends PluginSettingTab {
 						this.plugin.settings.autoMove = value;
 						await this.plugin.saveSettings();
 						this.plugin.refreshStatusBar();
+					})
+			);
+
+		new Setting(autoSection)
+			.setName("Restore descendants with parent")
+			.setDesc(
+				"When a completed parent is unchecked, restore its entire subtree and uncheck every descendant. When off, restore only the parent."
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.cascadeRestore)
+					.onChange(async (value) => {
+						this.plugin.settings.cascadeRestore = value;
+						await this.plugin.saveSettings();
 					})
 			);
 	}
